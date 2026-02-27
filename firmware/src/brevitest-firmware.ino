@@ -9,7 +9,7 @@
 #include "DFRobot_AS7341.h"
 
 PRODUCT_VERSION(61);
-SYSTEM_MODE(AUTOMATIC);
+SYSTEM_MODE(ENABLED);
 
 /////////////////////////////////////////////////////////////
 //                                                         //
@@ -4757,6 +4757,7 @@ void setup()
     Log.info("Device ID: %s", device_id.c_str());
 
     // === PARTICLE CLOUD VARIABLES ===
+    waitFor(Particle.connected, 20000);
     Particle.variable("temperature", current_temperature);
     Particle.variable("magnet_validation", magnet_validation_data);
 
