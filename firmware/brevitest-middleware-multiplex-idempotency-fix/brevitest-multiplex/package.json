@@ -1,0 +1,27 @@
+{
+    "name": "brevitest-multiplex",
+    "version": "1",
+    "description": "Multiplex middleware for Brevitest biomarker system",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "engines": {
+        "node": ">=20",
+        "npm": ">=10.2"
+    },
+    "author": "Leo Linbeck III",
+    "license": "MIT",
+    "dependencies": {
+        "dayjs": "^1.10.4"
+    },
+    "devDependencies": {},
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/leo3linbeck/brevitest-middleware.git"
+    },
+    "bugs": {
+        "url": "https://github.com/leo3linbeck/brevitest-middleware/issues"
+    },
+    "homepage": "https://github.com/leo3linbeck/brevitest-middleware/blob/master/README.md"
+}

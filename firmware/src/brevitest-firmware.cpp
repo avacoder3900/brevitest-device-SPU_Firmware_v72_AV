@@ -154,7 +154,7 @@ void hardware_loop();
 void process_serial_port();
 void loop();
 #line 11 "c:/Users/jacobq/Documents/GitHub/brevitest-device/firmware/src/brevitest-firmware.ino"
-PRODUCT_VERSION(66);
+PRODUCT_VERSION(67);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2359,62 +2359,12 @@ void response_validate_cartridge(CloudEvent cancel_event)
         return;  // Ignore response - device is no longer waiting for validation
     }
     
-    // === VERIFY REQUEST ID MATCH ===
-    // Check if response matches current request
-    if (validation_request_id.length() > 0)
-    {
-        Variant json_check = Variant::fromJSON(event_data);
-        String response_request_id = json_check.get("requestId").toString();
-        
-        if (response_request_id.length() > 0 && response_request_id != validation_request_id)
-        {
-            Log.warn("Response request ID mismatch - Expected: %s, Received: %s. Ignoring stale response.",
-                     validation_request_id.c_str(), response_request_id.c_str());
-            return;  // Ignore response that doesn't match current request
-        }
-        else if (response_request_id.length() == 0)
-        {
-            // Request ID missing - use cartridgeId as fallback verification
-            String response_cartridge_id = json_check.get("cartridgeId").toString();
-            String current_barcode = String(barcode_uuid);
-            
-            if (response_cartridge_id.length() > 0 && response_cartridge_id == current_barcode)
-            {
-                Log.info("Response missing request ID but cartridgeId matches current barcode - accepting response");
-            }
-            else if (response_cartridge_id.length() == 0)
-            {
-                Log.warn("Response missing both request ID and cartridgeId - may be from old request. Current ID: %s, Current barcode: %s",
-                         validation_request_id.c_str(), current_barcode.c_str());
-                // Continue processing but log warning
-            }
-            else
-            {
-                Log.warn("Response missing request ID and cartridgeId mismatch - Expected: %s, Received: %s. Ignoring stale response.",
-                         current_barcode.c_str(), response_cartridge_id.c_str());
-                return;  // Ignore response that doesn't match current cartridge
-            }
-        }
-        else
-        {
-            Log.info("Response request ID verified: %s", response_request_id.c_str());
-        }
-    }
-    
-    // === END CLOUD OPERATION TRACKING ===
-    device_state.end_cloud_operation();
-    
-    // === RESET RETRY TRACKING ON RESPONSE ===
-    validation_retry_count = 0;
-    validation_retry_delay_until = 0;
-    validation_request_id = "";  // Clear request ID after successful response
-
-    // === PARSE CLOUD RESPONSE ===
+    // === PARSE CLOUD RESPONSE (single parse, reused for ID check and processing) ===
     // Check if event data is valid
     if (event_data.length() == 0)
     {
         Log.error("Validation response is empty");
-        
+
         // Check if we can retry on empty response (might be transient)
         if (validation_retry_count < VALIDATION_MAX_RETRIES)
         {
@@ -2422,12 +2372,12 @@ void response_validate_cartridge(CloudEvent cancel_event)
             unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
             validation_retry_delay_until = millis() + backoff_delay;
             validation_request_id = "";  // Clear for retry
-            
-            Log.warn("Empty validation response, will retry in %lu ms (attempt %d/%d)", 
+
+            Log.warn("Empty validation response, will retry in %lu ms (attempt %d/%d)",
                      backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
             return;
         }
-        
+
         // Max retries exceeded
         device_state.cartridge_state = CartridgeState::INVALID;
         device_state.set_error("Empty validation response");
@@ -2436,9 +2386,9 @@ void response_validate_cartridge(CloudEvent cancel_event)
         validation_request_id = "";
         return;
     }
-    
+
     Variant json = Variant::fromJSON(event_data);
-    
+
     // Check if JSON parsing was successful
     if (json.isNull())
     {
@@ -2465,7 +2415,55 @@ void response_validate_cartridge(CloudEvent cancel_event)
         validation_request_id = "";
         return;
     }
-    
+
+    // === VERIFY REQUEST ID MATCH ===
+    // Check if response matches current request (using already-parsed json)
+    if (validation_request_id.length() > 0)
+    {
+        String response_request_id = json.get("requestId").toString();
+
+        if (response_request_id.length() > 0 && response_request_id != validation_request_id)
+        {
+            Log.warn("Response request ID mismatch - Expected: %s, Received: %s. Ignoring stale response.",
+                     validation_request_id.c_str(), response_request_id.c_str());
+            return;  // Ignore response that doesn't match current request
+        }
+        else if (response_request_id.length() == 0)
+        {
+            // Request ID missing - use cartridgeId as fallback verification
+            String response_cartridge_id = json.get("cartridgeId").toString();
+
+            if (response_cartridge_id.length() > 0 && response_cartridge_id == barcode_uuid)
+            {
+                Log.info("Response missing request ID but cartridgeId matches current barcode - accepting response");
+            }
+            else if (response_cartridge_id.length() == 0)
+            {
+                Log.warn("Response missing both request ID and cartridgeId - may be from old request. Current ID: %s, Current barcode: %s",
+                         validation_request_id.c_str(), barcode_uuid);
+                // Continue processing but log warning
+            }
+            else
+            {
+                Log.warn("Response missing request ID and cartridgeId mismatch - Expected: %s, Received: %s. Ignoring stale response.",
+                         barcode_uuid, response_cartridge_id.c_str());
+                return;  // Ignore response that doesn't match current cartridge
+            }
+        }
+        else
+        {
+            Log.info("Response request ID verified: %s", response_request_id.c_str());
+        }
+    }
+
+    // === END CLOUD OPERATION TRACKING ===
+    device_state.end_cloud_operation();
+
+    // === RESET RETRY TRACKING ON RESPONSE ===
+    validation_retry_count = 0;
+    validation_retry_delay_until = 0;
+    validation_request_id = "";  // Clear request ID after successful response
+
     String status = json.get("status").toString();
     Log.info("Validation response status: %s", status.c_str());
     
@@ -2895,8 +2893,6 @@ void response_load_assay(CloudEvent load_assay_event)
  */
 void publish_upload_test()
 {
-    particle::Variant data;
-
     // === CHECK IF WE CAN PUBLISH ===
     if (!event.isSending() && ((lastPublish == 0) || (millis() - lastPublish >= publishPeriod.count())))
     {
@@ -2905,7 +2901,7 @@ void publish_upload_test()
         {
             // No more tests to upload - transition back to IDLE
             Log.info("No test in cache - transitioning to IDLE");
-            
+
             // === CLEANUP VALIDATION RETRY TRACKING FOR NEXT TEST ===
             validation_retry_count = 0;
             validation_retry_delay_until = 0;
@@ -2914,11 +2910,11 @@ void publish_upload_test()
             {
                 device_state.end_cloud_operation();
             }
-            
+
             // Clear pending barcode state
             pending_barcode_available = false;
             pending_barcode_uuid[0] = '\0';
-            
+
             device_state.transition_to(DeviceMode::IDLE);
             return;
         }
@@ -2939,11 +2935,26 @@ void publish_upload_test()
         event.contentType(ContentType::BINARY);
         event.loadData(cached_filename);
 
+        // === VERIFY DATA LOADED SUCCESSFULLY ===
+        if (event.data().size() == 0)
+        {
+            Log.error("Failed to load test data from cache file: %s", cached_filename);
+            device_state.end_cloud_operation();
+            device_state.set_error("Failed to load cached test data");
+            return;
+        }
+
         // === PUBLISH IF POSSIBLE ===
         if (event.canPublish(event.size()))
         {
             Log.info("Publishing upload test, %s (%d bytes)", cached_filename, event.size());
             Particle.publish(event);
+        }
+        else
+        {
+            Log.error("Cannot publish upload test: event too large (%d bytes)", event.size());
+            device_state.end_cloud_operation();
+            device_state.set_error("Upload test event too large to publish");
         }
     }
 }
@@ -5013,6 +5024,15 @@ void setup()
     // === TRANSITION TO IDLE STATE ===
     // Setup complete - device is ready for operation
     device_state.transition_to(DeviceMode::IDLE);
+
+    // === AUTO-UPLOAD CACHED TEST IF PRESENT ===
+    // After crash/reboot, a completed test may be orphaned in cache
+    if (test_in_cache())
+    {
+        Log.info("Cached test found on boot - transitioning to UPLOADING_RESULTS");
+        device_state.test_state = TestState::UPLOAD_PENDING;
+        device_state.transition_to(DeviceMode::UPLOADING_RESULTS);
+    }
 
     Log.info("Setup complete");
 }
