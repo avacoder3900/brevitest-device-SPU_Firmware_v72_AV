@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(67);
+PRODUCT_VERSION(68);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -286,11 +286,17 @@ bool create_dir_if_not_exists(const char *path)
 void write_test_to_file()
 {
     struct stat statbuf;
-    event.data((char *)&test, sizeof(test), ContentType::BINARY);
     String filename = "/cache/" + String(test.cartridge_id);
-    event.saveData(filename);
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0)
+    {
+        Log.error("write_test_to_file: failed to open %s, errno: %d", filename.c_str(), errno);
+        return;
+    }
+    int written = write(fd, (char *)&test, sizeof(test));
+    close(fd);
     stat(filename, &statbuf);
-    Log.info("write_test_to_file, test size: %d, event data size: %d, file size: %ld", sizeof test, event.data().size(), statbuf.st_size);
+    Log.info("write_test_to_file, test size: %d, bytes written: %d, file size: %ld", sizeof test, written, statbuf.st_size);
 }
 
 void clear_cache()
@@ -318,11 +324,17 @@ void load_cached_test(char *filename)
         Log.error("load_cached_test: filename is NULL");
         return;
     }
-    event.loadData(filename);
-    BrevitestTestRecord *t = (BrevitestTestRecord *)event.data().data();
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0)
+    {
+        Log.error("load_cached_test: failed to open %s, errno: %d", filename, errno);
+        return;
+    }
+    int bytes_read = read(fd, (char *)&test, sizeof(test));
+    close(fd);
     stat(filename, &statbuf);
-    Log.info("load_cached_test from %s, test size: %d, event data size: %d, file size: %ld", filename, sizeof *t, event.data().size(), statbuf.st_size);
-    Log.info("Test loaded, cartridge: %s, assay: %s, readings: %d", t->cartridge_id, t->assay_id, t->number_of_readings);
+    Log.info("load_cached_test from %s, test size: %d, bytes read: %d, file size: %ld", filename, (int)sizeof(test), bytes_read, statbuf.st_size);
+    Log.info("Test loaded, cartridge: %s, assay: %s, readings: %d", test.cartridge_id, test.assay_id, test.number_of_readings);
 }
 
 bool test_in_cache()
@@ -377,8 +389,15 @@ void output_cache()
         if (strlen(cache_entry->d_name) == BARCODE_UUID_LENGTH)
         {
             snprintf(cached_filename, sizeof(cached_filename), "/cache/%s", cache_entry->d_name);
-            event.loadData(cached_filename);
-            output_test_readings((BrevitestTestRecord *)event.data().data());
+            int fd = open(cached_filename, O_RDONLY);
+            if (fd < 0)
+            {
+                Log.error("output_cache: failed to open %s, errno: %d", cached_filename, errno);
+                continue;
+            }
+            read(fd, (char *)&test, sizeof(test));
+            close(fd);
+            output_test_readings(&test);
         }
     } while (cache_entry != NULL && --tries > 0);
     closedir(cache);
@@ -2098,6 +2117,7 @@ void publish_validate_cartridge()
         // === PREPARE CLOUD EVENT ===
         lastPublish = millis();
         clear_payload_buffer();
+        event.clear();
         event.name("validate-cartridge");
         event.contentType(ContentType::STRUCTURED);
         data.set("uuid", barcode_uuid);
@@ -2194,13 +2214,12 @@ void publish_validate_cartridge()
  *
  * @param cancel_event The cloud event containing the validation response
  */
-void response_validate_cartridge(CloudEvent cancel_event)
+void response_validate_cartridge(const char *event_name, const char *data)
 {
-    String event_data = cancel_event.dataString();
-    String event_name = cancel_event.name();
-    
-    Log.info("Validation response received - Event: %s, Data length: %d, Current mode: %s", 
-             event_name.c_str(), event_data.length(),
+    String event_data = String(data);
+
+    Log.info("Validation response received - Event: %s, Data length: %d, Current mode: %s",
+             event_name, event_data.length(),
              device_mode_to_string(device_state.mode).c_str());
     
     // === CHECK IF DEVICE IS IN VALID STATE FOR VALIDATION RESPONSE ===
@@ -2434,6 +2453,7 @@ void publish_reset_cartridge()
         device_state.start_cloud_operation();
 
         // === PREPARE CLOUD EVENT ===
+        event.clear();
         event.name("reset-cartridge");
         event.contentType(ContentType::STRUCTURED);
         data.set("uuid", reset_uuid);
@@ -2457,13 +2477,13 @@ void publish_reset_cartridge()
  *
  * @param reset_event The cloud event containing the reset response
  */
-void response_reset_cartridge(CloudEvent reset_event)
+void response_reset_cartridge(const char *event_name, const char *data)
 {
     // === END CLOUD OPERATION TRACKING ===
     device_state.end_cloud_operation();
 
     // === PARSE CLOUD RESPONSE ===
-    Variant json = Variant::fromJSON(reset_event.dataString());
+    Variant json = Variant::fromJSON(String(data));
     if (json.get("status").toString() == "SUCCESS")
     {
         // === CARTRIDGE RESET SUCCESSFUL ===
@@ -2514,6 +2534,7 @@ void publish_load_assay(String assay_to_load)
         lastPublish = millis();
 
         clear_payload_buffer();
+        event.clear();
         event.name("load-assay");
         event.contentType(ContentType::STRUCTURED);
         data.set("assay_id", assay_to_load);
@@ -2567,16 +2588,17 @@ bool all_payloads_received()
     return all;
 }
 
-void response_load_assay(CloudEvent load_assay_event)
+void response_load_assay(const char *event_name, const char *data)
 {
-    Log.info("response_load_assay event: name=%s, size=%d, content type=%d", load_assay_event.name(), load_assay_event.data().size(), (int)load_assay_event.contentType());
+    String name = String(event_name);
+    int data_len = strlen(data);
+    Log.info("response_load_assay event: name=%s, size=%d", event_name, data_len);
     String final_result;
-    String name = load_assay_event.name();
 
     int index = limit(name.substring(name.length() - 1).toInt(), PARTICLE_PAYLOAD_BUFFER_SIZE - 1, 0);
-    Log.info("response_load_assay data size: %d, index: %d", load_assay_event.data().size(), index);
+    Log.info("response_load_assay data size: %d, index: %d", data_len, index);
 
-    payload_buffer[index] = load_assay_event.dataString();
+    payload_buffer[index] = String(data);
     if (!all_payloads_received())
         return;
 
@@ -2785,6 +2807,10 @@ void publish_upload_test()
         lastPublish = millis();
         device_state.start_cloud_operation();
 
+        // Clear stale state from previous publishes (e.g. validate-cartridge)
+        // before reusing the global event object with a different content type
+        event.clear();
+
         event.name("upload-test");
         event.contentType(ContentType::BINARY);
         event.loadData(cached_filename);
@@ -2822,7 +2848,7 @@ void publish_upload_test()
  *
  * @param upload_event The cloud event containing the upload response
  */
-void response_upload_test(CloudEvent upload_event)
+void response_upload_test(const char *event_name, const char *data)
 {
     // === CHECK IF DEVICE IS IN VALID STATE FOR UPLOAD RESPONSE ===
     // Only process upload responses when in UPLOADING_RESULTS mode
@@ -2835,12 +2861,12 @@ void response_upload_test(CloudEvent upload_event)
                  device_mode_to_string(device_state.mode).c_str());
         return;  // Ignore response - device is no longer uploading
     }
-    
+
     // === END CLOUD OPERATION TRACKING ===
     device_state.end_cloud_operation();
 
     // === PARSE CLOUD RESPONSE ===
-    Variant json = Variant::fromJSON(upload_event.dataString());
+    Variant json = Variant::fromJSON(String(data));
     String cartridgeId = json.get("cartridgeId").toString();
     if (json.get("status").toString() == "SUCCESS")
     {
@@ -4543,8 +4569,6 @@ void connect_to_cloud()
     if (Particle.connected())
     {
         Log.info("Connected to cloud");
-        // Re-register subscriptions after reconnection to ensure they're active
-        register_cloud_subscriptions();
     }
     else
     {
@@ -4646,11 +4670,12 @@ void run_test()
     device_state.test_state = TestState::UPLOAD_PENDING;
     device_state.transition_to(DeviceMode::UPLOADING_RESULTS);
 
-    // === CLEANUP AND RECONNECT ===
+    // === CLEANUP AND RECONNECT FOR UPLOAD ===
     reset_stage(true);
-    connect_to_cloud();
-    // Turn off buzzer - device is not ready (uploading results)
     turn_off_buzzer_timer();
+
+    Log.info("Test complete, reconnecting to cloud for upload...");
+    connect_to_cloud();
 }
 
 /////////////////////////////////////////////////////////////
@@ -5469,11 +5494,10 @@ void loop()
     static bool last_cloud_connected = false;
     bool current_cloud_connected = Particle.connected();
     
-    // Detect when connection is restored and re-register subscriptions
+    // Detect when connection is restored (subscriptions persist in RAM, no re-registration needed)
     if (current_cloud_connected && !last_cloud_connected)
     {
-        Log.info("Cloud connection restored - re-registering subscriptions");
-        register_cloud_subscriptions();
+        Log.info("Cloud connection restored");
     }
     last_cloud_connected = current_cloud_connected;
     
