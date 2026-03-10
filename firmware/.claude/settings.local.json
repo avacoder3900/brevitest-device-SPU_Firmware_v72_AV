@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(particle compile:*)",
+      "Bash(particle whoami:*)",
+      "Bash(arm-none-eabi-addr2line:*)",
+      "Bash(/c/Users/jacobq/.particle/toolchains/gcc-arm/10.2.1/bin/arm-none-eabi-addr2line.exe:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.particle.io)",
+      "WebFetch(domain:github.com)",
+      "Bash(printf 0x%x\\\\n:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:community.particle.io)",
+      "WebFetch(domain:docs.staging.particle.io)",
+      "WebFetch(domain:changelog.particle.io)",
+      "Bash(curl:*)"
+    ]
+  }
+}

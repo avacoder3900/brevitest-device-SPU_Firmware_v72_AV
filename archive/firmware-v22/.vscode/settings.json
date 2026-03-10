@@ -1,0 +1,14 @@
+{
+    "extensions.ignoreRecommendations": true,
+    "C_Cpp.default.configurationProvider": "particle.particle-vscode-core",
+    "cortex-debug.openocdPath": "${command:particle.getDebuggerOpenocdPath}",
+    "files.associations": {
+        "*.ino": "cpp",
+        "condition_variable": "cpp",
+        "future": "cpp"
+    },
+    "particle.targetPlatform": "boron",
+    "particle.firmwareVersion": "1.4.4",
+    "git.autofetch": true,
+    "particle.targetDevice": "Ingold"
+}
