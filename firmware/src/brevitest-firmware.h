@@ -7,8 +7,8 @@
 // GLOBAL VARIABLES AND DEFINES
 
 // general constants
-#define FIRMWARE_VERSION 70
-#define DATA_FORMAT_VERSION 39
+#define FIRMWARE_VERSION 71
+#define DATA_FORMAT_VERSION 40
 
 #define TEST_DATA_FORMAT_CODE 'J'
 #define ASSAY_UUID_LENGTH 8
@@ -167,6 +167,73 @@
 
 // stress test
 #define STRESS_TEST_MAXIMUM_RECORDS 15
+
+// ============================================================
+//  EEPROM CHECKPOINT CODES
+//  Pattern: even = BEFORE operation, odd = AFTER (success)
+//  If last checkpoint is even, the operation it marks is
+//  where the crash/hang/power-loss occurred.
+// ============================================================
+
+#define CP_BUFFER_SIZE 40
+
+// --- CLOUD OPERATIONS (10-29) ---
+#define CP_CLOUD_DISCONNECT              10
+#define CP_CLOUD_DISCONNECT_OK           11
+#define CP_CLOUD_CONNECT                 12
+#define CP_CLOUD_CONNECT_OK              13
+#define CP_CLOUD_PUBLISH_VALIDATE        14
+#define CP_CLOUD_PUBLISH_VALIDATE_OK     15
+#define CP_CLOUD_PUBLISH_LOAD_ASSAY      16
+#define CP_CLOUD_PUBLISH_LOAD_ASSAY_OK   17
+#define CP_CLOUD_PUBLISH_UPLOAD          18
+#define CP_CLOUD_PUBLISH_UPLOAD_OK       19
+#define CP_CLOUD_PUBLISH_RESET           20
+#define CP_CLOUD_PUBLISH_RESET_OK        21
+#define CP_WEBHOOK_RESPONSE_RECEIVED     22
+#define CP_WEBHOOK_TIMEOUT               23
+
+// --- BCODE EXECUTION (30-31) ---
+#define CP_BCODE_START                   30
+#define CP_BCODE_COMPLETE                31
+
+// --- SPECTROPHOTOMETER (40-41) ---
+#define CP_SPECTRO_READING_START         40
+#define CP_SPECTRO_READING_COMPLETE      41
+
+// --- FILE I/O (50-57) ---
+#define CP_FILE_WRITE_TEST               50
+#define CP_FILE_WRITE_TEST_OK            51
+#define CP_FILE_READ_ASSAY               52
+#define CP_FILE_READ_ASSAY_OK            53
+#define CP_FILE_WRITE_ASSAY              54
+#define CP_FILE_WRITE_ASSAY_OK           55
+#define CP_FILE_FLUSH_LOG                56
+#define CP_FILE_FLUSH_LOG_OK             57
+
+// --- HARDWARE (60-67) ---
+#define CP_STAGE_RESET                   60
+#define CP_STAGE_RESET_OK                61
+#define CP_BARCODE_SCAN                  62
+#define CP_BARCODE_SCAN_OK               63
+#define CP_I2C_BUS_INIT                  64
+#define CP_I2C_BUS_INIT_OK               65
+
+// --- TEST LIFECYCLE (70-73) ---
+#define CP_TEST_START                    70
+#define CP_TEST_HARDWARE_SETUP           71
+
+// --- SPECIAL CONDITIONS (80+) ---
+#define CP_HEATER_OVERHEAT               80
+
+// ============================================================
+//  LOG BUFFER
+// ============================================================
+
+#define LOG_BUFFER_LINES 100
+#define LOG_LINE_LENGTH 120
+#define LOG_FILE_MAX_SIZE 32768
+#define LOG_FLUSH_IDLE_INTERVAL_MS 30000
 
 // pin definitions
 hal_pin_t pinBuzzer = A0;
@@ -396,6 +463,7 @@ char assay_buffer[BCODE_CAPACITY + 40];
 
 struct Particle_EEPROM
 {
+    // Existing fields — offsets unchanged for safe migration
     uint8_t firmware_version = FIRMWARE_VERSION;
     uint8_t data_format_version = DATA_FORMAT_VERSION;
     int lifetime_stress_test_cycles = 0;
@@ -404,7 +472,27 @@ struct Particle_EEPROM
     int stress_test_reading_count = 0;
     char running_test_uuid[BARCODE_UUID_LENGTH + 1];
     char running_assay_id[ASSAY_UUID_LENGTH + 1];
+
+    // Crash checkpoint system (appended at end — never insert above existing fields)
+    uint8_t cp_boot_count = 0;
+    uint8_t cp_index = 0;
+    uint8_t cp_buffer[CP_BUFFER_SIZE] = {0};
 } eeprom;
+
+// RAM log buffer for device_log() -> flush_log_to_file() pipeline
+struct LogBuffer {
+    char lines[LOG_BUFFER_LINES][LOG_LINE_LENGTH];
+    int index;
+    int count;
+
+    LogBuffer() : index(0), count(0) {
+        memset(lines, 0, sizeof(lines));
+    }
+};
+LogBuffer log_buffer;
+
+// Heater temperature monitoring — threshold-based logging
+int last_logged_temp = 0;
 
 // communication status state
 struct RadioState {

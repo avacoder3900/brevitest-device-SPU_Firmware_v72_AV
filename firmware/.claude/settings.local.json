@@ -16,7 +16,9 @@
       "WebFetch(domain:docs.staging.particle.io)",
       "WebFetch(domain:changelog.particle.io)",
       "Bash(curl:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "WebFetch(domain:)"
     ]
   }
 }
