@@ -1343,6 +1343,8 @@ void close_magnet_validation_file(int fd)
     Log.info("write_magnet_validation_to_file, test size: %d, event data size: %d, file size: %ld", sizeof test, event.data().size(), statbuf.st_size);
 }
 
+int mag_buf_offset = 0;
+
 void check_magnets_in_one_well(int well, int fd)
 {
     BleCharacteristic characteristic;
@@ -1360,6 +1362,9 @@ void check_magnets_in_one_well(int well, int fd)
     out_str = String::format("%d\t%s\r\n", (well + 1), result.c_str());
     Serial.print(out_str.c_str());
     write(fd, out_str.c_str(), out_str.length());
+    // Also accumulate directly into Particle variable buffer
+    mag_buf_offset += snprintf(magnet_validation_data + mag_buf_offset,
+        MAGNETOMETER_BUFFER_SIZE - mag_buf_offset, "%d\t%s\r\n", (well + 1), result.c_str());
 }
 
 int validate_magnets()
@@ -1388,6 +1393,10 @@ int validate_magnets()
                 write(fd, magnet_title_2.c_str(), magnet_title_2.length());
                 Serial.print(magnet_title_1.c_str());
                 Serial.print(magnet_title_2.c_str());
+                // Seed Particle variable buffer directly with headers
+                memset(magnet_validation_data, 0, MAGNETOMETER_BUFFER_SIZE);
+                mag_buf_offset = snprintf(magnet_validation_data, MAGNETOMETER_BUFFER_SIZE,
+                    "%s%s", magnet_title_1.c_str(), magnet_title_2.c_str());
                 for (int i = 0; i < MAGNETOMETER_NUMBER_OF_WELLS; i++)
                 {
                     check_magnets_in_one_well(i, fd);
@@ -5289,9 +5298,7 @@ void magnet_validation_loop()
 {
     if (validate_magnets())
     {
-        delay(100);                                                    // filesystem flush
-        memset(magnet_validation_data, 0, MAGNETOMETER_BUFFER_SIZE);   // clear stale data
-        load_latest_magnet_validation(false);                          // refresh Particle variable
+        // Buffer already populated directly during validate_magnets() — no file reload needed
         device_state.transition_to(DeviceMode::IDLE);
     }
 }
