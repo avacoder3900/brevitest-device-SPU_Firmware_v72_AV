@@ -1344,6 +1344,7 @@ void close_magnet_validation_file(int fd)
 }
 
 int mag_buf_offset = 0;
+int mag_test_counter = 0;
 
 void check_magnets_in_one_well(int well, int fd)
 {
@@ -1393,10 +1394,12 @@ int validate_magnets()
                 write(fd, magnet_title_2.c_str(), magnet_title_2.length());
                 Serial.print(magnet_title_1.c_str());
                 Serial.print(magnet_title_2.c_str());
-                // Seed Particle variable buffer directly with headers
+                // Seed Particle variable buffer with test counter + headers
+                mag_test_counter++;
                 memset(magnet_validation_data, 0, MAGNETOMETER_BUFFER_SIZE);
                 mag_buf_offset = snprintf(magnet_validation_data, MAGNETOMETER_BUFFER_SIZE,
-                    "%s%s", magnet_title_1.c_str(), magnet_title_2.c_str());
+                    "#%03d\t%lu\r\n%s%s", mag_test_counter, (unsigned long)Time.now(),
+                    magnet_title_1.c_str(), magnet_title_2.c_str());
                 for (int i = 0; i < MAGNETOMETER_NUMBER_OF_WELLS; i++)
                 {
                     check_magnets_in_one_well(i, fd);
