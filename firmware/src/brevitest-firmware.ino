@@ -5286,6 +5286,7 @@ void magnet_validation_loop()
 {
     if (validate_magnets())
     {
+        load_latest_magnet_validation(false);
         device_state.transition_to(DeviceMode::IDLE);
     }
 }
