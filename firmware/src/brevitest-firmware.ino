@@ -1252,8 +1252,11 @@ int load_latest_magnet_validation(bool serial_output = true)
             Log.error("Failed to open latest validation file: %s, errno: %d", magnet_validation_filename.c_str(), errno);
             return -1;
         }
-        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE);
+        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE - 1);
         close(fd);
+        if (bytes_read > 0) {
+            magnet_validation_data[bytes_read] = '\0';
+        }
         Log.info("Latest validation file: %s, bytes: %d", magnet_validation_filename.c_str(), bytes_read);
         if (serial_output)
         {
@@ -5286,7 +5289,9 @@ void magnet_validation_loop()
 {
     if (validate_magnets())
     {
-        load_latest_magnet_validation(false);
+        delay(100);                                                    // filesystem flush
+        memset(magnet_validation_data, 0, MAGNETOMETER_BUFFER_SIZE);   // clear stale data
+        load_latest_magnet_validation(false);                          // refresh Particle variable
         device_state.transition_to(DeviceMode::IDLE);
     }
 }
