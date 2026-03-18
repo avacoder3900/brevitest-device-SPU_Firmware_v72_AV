@@ -7,7 +7,7 @@
 // GLOBAL VARIABLES AND DEFINES
 
 // general constants
-#define FIRMWARE_VERSION 71
+#define FIRMWARE_VERSION 72
 #define DATA_FORMAT_VERSION 40
 
 #define TEST_DATA_FORMAT_CODE 'J'
@@ -85,6 +85,12 @@
 // BCODE
 #define BCODE_CAPACITY 5000
 #define BCODE_MAX_DELAY 500
+
+// sinusoidal motion
+#define SINUSOIDAL_MAX_STEPS 500
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 // particle
 #define PARTICLE_REGISTER_SIZE 622

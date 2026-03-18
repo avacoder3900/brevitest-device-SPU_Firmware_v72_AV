@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(71);
+PRODUCT_VERSION(72);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -1100,6 +1100,107 @@ void oscillate_stage(int amplitude, int step_delay, int cycles, bool inBCODE)
         if (inBCODE)
             BCODE_loop();
         move_stage(-amplitude, step_delay);
+        if (inBCODE)
+            BCODE_loop();
+        if (device_state.test_state == TestState::CANCELLED)
+            return;
+    }
+}
+
+/**
+ * @brief Move stage with sinusoidal velocity profile (one half-stroke)
+ *
+ * Position follows x(t) = D/2 * (1 - cos(pi*t/T)), producing smooth
+ * acceleration from rest, peak velocity at midpoint, deceleration to rest.
+ *
+ * @param microns Distance to move (positive = distal, negative = proximal)
+ * @param half_period_ms Time for this half-stroke in milliseconds
+ */
+void move_stage_sinusoidal(int microns, int half_period_ms)
+{
+    int abs_microns, N, dir;
+
+    if (!motor_awake)
+    {
+        wake_motor();
+    }
+
+    dir = (microns < 0) ? HIGH : LOW;
+    digitalWrite(pinMotorDir, dir);
+
+    abs_microns = abs(microns) + microns_error;
+    N = abs_microns / MOTOR_MICRONS_PER_EIGHTH_STEP;
+    microns_error = abs_microns % MOTOR_MICRONS_PER_EIGHTH_STEP;
+
+    if (N == 0)
+    {
+        Log.warn("move_stage_sinusoidal: zero steps (microns=%d)", microns);
+        return;
+    }
+    if (N > SINUSOIDAL_MAX_STEPS)
+    {
+        Log.warn("move_stage_sinusoidal: %d steps exceeds max %d", N, SINUSOIDAL_MAX_STEPS);
+        return;
+    }
+
+    // Precompute phase delays for sinusoidal velocity profile
+    // Time at step i: t_i = T/pi * acos(1 - 2*i/N)
+    // Total time per step: t_{i+1} - t_i
+    // Phase delay (per HIGH/LOW phase): step_time / 2
+    static int delays[SINUSOIDAL_MAX_STEPS];
+    float T_half_us = half_period_ms * 1000.0f;
+    int clamped_count = 0;
+
+    for (int i = 0; i < N; i++)
+    {
+        float theta_i = acosf(1.0f - 2.0f * (float)i / (float)N);
+        float theta_next = acosf(1.0f - 2.0f * (float)(i + 1) / (float)N);
+        float step_time_us = (T_half_us / (float)M_PI) * (theta_next - theta_i);
+        int phase_delay = (int)(step_time_us / 2.0f);
+        if (phase_delay < MOTOR_MINIMUM_STEP_DELAY)
+        {
+            phase_delay = MOTOR_MINIMUM_STEP_DELAY;
+            clamped_count++;
+        }
+        delays[i] = phase_delay;
+    }
+
+    if (clamped_count > 0)
+    {
+        Log.warn("Sinusoidal move: %d/%d steps clamped to min delay %d us", clamped_count, N, MOTOR_MINIMUM_STEP_DELAY);
+    }
+
+    // Execute steps with precomputed sinusoidal delays
+    for (int i = 0; i < N; i++)
+    {
+        if (!move_one_eighth_step(dir, delays[i]))
+        {
+            break;
+        }
+    }
+}
+
+/**
+ * @brief Oscillate stage with sinusoidal velocity profile
+ *
+ * Full back-and-forth oscillation with smooth sinusoidal motion.
+ * Each half-stroke follows a cosine position profile for jerk-free reversals.
+ *
+ * @param amplitude Distance of one half-stroke in microns
+ * @param period_ms Time for one full cycle (back and forth) in milliseconds
+ * @param cycles Number of full oscillation cycles
+ * @param inBCODE If true, calls BCODE_loop() at each reversal for heater PID and cartridge detection
+ */
+void oscillate_stage_sinusoidal(int amplitude, int period_ms, int cycles, bool inBCODE)
+{
+    int half_period_ms = period_ms / 2;
+
+    for (int i = 0; i < cycles; i++)
+    {
+        move_stage_sinusoidal(amplitude, half_period_ms);
+        if (inBCODE)
+            BCODE_loop();
+        move_stage_sinusoidal(-amplitude, half_period_ms);
         if (inBCODE)
             BCODE_loop();
         if (device_state.test_state == TestState::CANCELLED)
@@ -2965,6 +3066,19 @@ int process_one_BCODE_command(int cmd, int index)
         index = get_BCODE_token(index, &param3); // number of cycles
         Log.info("Oscillate %d microns, %d µs, %d cycles", param1, param2, param3);
         oscillate_stage(param1, param2, param3, true);
+        break;
+    case 4:                                      // Sinusoidal Oscillate(microns, period_ms, cycles)
+        index = get_BCODE_token(index, &param1); // microns amplitude
+        index = get_BCODE_token(index, &param2); // period_ms (full cycle)
+        index = get_BCODE_token(index, &param3); // number of cycles
+        Log.info("Sinusoidal oscillate %d microns, %d ms period, %d cycles", param1, param2, param3);
+        oscillate_stage_sinusoidal(param1, param2, param3, true);
+        break;
+    case 5:                                      // Sinusoidal Move(microns, half_period_ms)
+        index = get_BCODE_token(index, &param1); // microns (positive or negative)
+        index = get_BCODE_token(index, &param2); // half_period_ms
+        Log.info("Sinusoidal move %d microns, %d ms", param1, param2);
+        move_stage_sinusoidal(param1, param2);
         break;
     case 10:                                     // Set sensor params
         index = get_BCODE_token(index, &param1); // gain
@@ -5221,10 +5335,10 @@ void hardware_loop()
     heater_ready = (temp_delta >= 0 && temp_delta < HEATER_READY_TEMP_DELTA);
     device_state.heater_ready = heater_ready;
 
-    // Log heater_ready state changes
+    // Log heater_ready state changes (serial only — flash log captures 0.5°C threshold changes instead)
     if (heater_ready != previous_heater_ready)
     {
-        device_log("Heater ready: %s (temp: %d.%d C, target: %d.%d C)",
+        Log.info("Heater ready: %s (temp: %d.%d C, target: %d.%d C)",
                  heater_ready ? "YES" : "NO",
                  heater.temp_C_10X / 10, heater.temp_C_10X % 10,
                  heater.target_C_10X / 10, heater.target_C_10X % 10);

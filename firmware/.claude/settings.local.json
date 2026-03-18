@@ -18,7 +18,9 @@
       "Bash(curl:*)",
       "Bash(ls:*)",
       "Bash(xargs:*)",
-      "WebFetch(domain:)"
+      "WebFetch(domain:)",
+      "Bash(pip install:*)",
+      "Bash(python:*)"
     ]
   }
 }
