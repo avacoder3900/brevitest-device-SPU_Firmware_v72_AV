@@ -648,6 +648,169 @@ void testFCCCompliance()
     Serial.println("✓ WiFi, Cellular, and Bluetooth ON");
 }
 
+// ─── FCC WORST-CASE EMISSION TEST ───────────────────────────
+// Runs all noisy peripherals simultaneously to find peak
+// unintentional radiated/conducted emissions for FCC Part 15
+// Subpart B testing (ANSI C63.4-2014).
+//
+// Command 8504: Start worst-case emission mode
+// Command 8505: Stop worst-case emission mode
+//
+// What it activates:
+//   • Stepper motor oscillating continuously (highest noise source)
+//   • Heater at max PWM duty cycle
+//   • All 3 LEDs/lasers ON at full power
+//   • Buzzer pulsing at test frequency
+//   • Spectrophotometer I2C bus active (reading continuously)
+//   • All radios ON (WiFi + Cellular + BLE)
+//
+// ⚠️  DO NOT insert a cartridge during this test.
+//     Heater runs at max power with no thermal feedback.
+//     Motor oscillates without limit switch protection.
+//     Run only under supervised lab conditions.
+// ────────────────────────────────────────────────────────────
+
+bool fcc_worst_case_running = false;
+unsigned long fcc_motor_last_step = 0;
+unsigned long fcc_buzzer_last_toggle = 0;
+bool fcc_buzzer_on = false;
+int fcc_motor_direction = LOW;
+unsigned long fcc_motor_steps = 0;
+
+void startFCCWorstCase()
+{
+    Serial.println("\n╔════════════════════════════════════════════════════╗");
+    Serial.println("║   FCC WORST-CASE UNINTENTIONAL RADIATOR TEST      ║");
+    Serial.println("║   All peripherals active for max emission          ║");
+    Serial.println("╠════════════════════════════════════════════════════╣");
+    Serial.println("║  ⚠️  DO NOT INSERT CARTRIDGE                       ║");
+    Serial.println("║  ⚠️  SUPERVISED LAB USE ONLY                       ║");
+    Serial.println("║  ⚠️  Send 8505 to stop                             ║");
+    Serial.println("╚════════════════════════════════════════════════════╝");
+
+    // 1. Enable all radios
+    enableAllRadios();
+    Serial.println("  ✓ All radios ON (WiFi + Cellular + BLE)");
+
+    // 2. Wake motor and start oscillating
+    wake_motor();
+    digitalWrite(pinMotorDir, LOW);
+    fcc_motor_direction = LOW;
+    fcc_motor_steps = 0;
+    fcc_motor_last_step = micros();
+    Serial.println("  ✓ Motor awake — oscillating");
+
+    // 3. Heater at max power (no thermal control loop)
+    analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
+    Serial.println("  ✓ Heater at MAX power (PWM 255 @ 150 Hz)");
+
+    // 4. All LEDs/lasers ON at full power
+    analogWrite(pinLaserA, 255);
+    analogWrite(pinLaserB, 255);
+    analogWrite(pinLaserC, 255);
+    Serial.println("  ✓ All 3 LEDs/Lasers at full power");
+
+    // 5. Spectrophotometer switch active (cycle through channels)
+    init_spectrophotometer_switch();
+    Wire.beginTransmission(SPECTRO_SWITCH_ADDR);
+    Wire.write(SPECTRO_SWITCH_OUTPUT_COMMAND);
+    Wire.write(SPECTRO_SWITCH_TURN_ON_A | SPECTRO_SWITCH_TURN_ON_B | SPECTRO_SWITCH_TURN_ON_C);
+    Wire.endTransmission();
+    Serial.println("  ✓ Spectrophotometer I2C active (all channels)");
+
+    // 6. Buzzer pulsing
+    tone(pinBuzzer, BUZZER_FREQUENCY, 0); // continuous tone
+    fcc_buzzer_on = true;
+    fcc_buzzer_last_toggle = millis();
+    Serial.println("  ✓ Buzzer pulsing at 600 Hz");
+
+    fcc_worst_case_running = true;
+
+    Serial.println("\n  ▶ WORST-CASE EMISSION MODE ACTIVE");
+    Serial.println("    All peripherals running simultaneously.");
+    Serial.println("    Test lab can now measure peak emissions.");
+    Serial.println("    Send command 8505 to stop.\n");
+}
+
+void stopFCCWorstCase()
+{
+    fcc_worst_case_running = false;
+
+    // Stop motor
+    sleep_motor();
+
+    // Stop heater
+    analogWrite(pinHeater, 0);
+
+    // Stop LEDs
+    analogWrite(pinLaserA, 0);
+    analogWrite(pinLaserB, 0);
+    analogWrite(pinLaserC, 0);
+
+    // Stop buzzer
+    noTone(pinBuzzer);
+    fcc_buzzer_on = false;
+
+    // Turn off spectrophotometer switches
+    Wire.beginTransmission(SPECTRO_SWITCH_ADDR);
+    Wire.write(SPECTRO_SWITCH_OUTPUT_COMMAND);
+    Wire.write(SPECTRO_SWITCH_TURN_OFF_ALL);
+    Wire.endTransmission();
+
+    // Disable radios
+    disableAllRadios();
+
+    Serial.println("\n╔════════════════════════════════════════════════════╗");
+    Serial.println("║   WORST-CASE EMISSION TEST STOPPED                ║");
+    Serial.println("║   All peripherals deactivated                     ║");
+    Serial.println("╚════════════════════════════════════════════════════╝");
+}
+
+// Call this from loop() to keep motor oscillating and buzzer pulsing
+void updateFCCWorstCase()
+{
+    if (!fcc_worst_case_running)
+        return;
+
+    // Oscillate motor: step every MOTOR_MINIMUM_STEP_DELAY microseconds
+    // Reverse direction every 2000 steps (~50mm travel)
+    unsigned long now_us = micros();
+    if (now_us - fcc_motor_last_step >= (unsigned long)MOTOR_MINIMUM_STEP_DELAY)
+    {
+        fcc_motor_last_step = now_us;
+        digitalWrite(pinMotorStep, HIGH);
+        delayMicroseconds(2);
+        digitalWrite(pinMotorStep, LOW);
+        fcc_motor_steps++;
+
+        if (fcc_motor_steps >= 2000)
+        {
+            fcc_motor_steps = 0;
+            fcc_motor_direction = (fcc_motor_direction == LOW) ? HIGH : LOW;
+            digitalWrite(pinMotorDir, fcc_motor_direction);
+        }
+    }
+
+    // Pulse buzzer: 500ms on, 500ms off
+    unsigned long now_ms = millis();
+    if (now_ms - fcc_buzzer_last_toggle >= 500)
+    {
+        fcc_buzzer_last_toggle = now_ms;
+        if (fcc_buzzer_on)
+        {
+            noTone(pinBuzzer);
+            fcc_buzzer_on = false;
+        }
+        else
+        {
+            tone(pinBuzzer, BUZZER_FREQUENCY, 0);
+            fcc_buzzer_on = true;
+        }
+    }
+}
+
+// ─── END FCC WORST-CASE TEST ────────────────────────────────
+
 void emissionCheck()
 {
     Serial.println("\n╔════════════════════════════════╗");
@@ -716,6 +879,8 @@ void displayHelp()
     Serial.println("║   8501 - Test Cellular only           ║");
     Serial.println("║   8502 - Test Bluetooth only          ║");
     Serial.println("║   8503 - FCC compliance (all radios)  ║");
+    Serial.println("║   8504 - WORST-CASE emission test     ║");
+    Serial.println("║   8505 - Stop worst-case test         ║");
     Serial.println("║                                       ║");
     Serial.println("║ MASTER CONTROL:                       ║");
     Serial.println("║   8900 - ALL radios OFF               ║");
@@ -3863,6 +4028,14 @@ int particle_command(String arg)
         testFCCCompliance();
         break;
 
+    case 8504:
+        startFCCWorstCase();
+        break;
+
+    case 8505:
+        stopFCCWorstCase();
+        break;
+
     // ===== EMISSION CHECK =====
     case 8999:
         emissionCheck();
@@ -5520,6 +5693,7 @@ void loop()
     // === ALWAYS RUN THESE ===
     process_serial_port(); // Handle serial commands
     hardware_loop();       // Handle hardware state changes
+    updateFCCWorstCase();  // FCC emission test motor/buzzer updates (no-op when inactive)
 
     // === STATE-DRIVEN OPERATION ===
     // Each device mode has specific actions that are appropriate for that state
