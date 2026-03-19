@@ -1,60 +1,70 @@
 # Middleware Changes for Sinusoidal BCODE Commands
 
-Firmware v72 adds two new BCODE commands (4 and 5) for sinusoidal stage motion. The middleware must be updated to recognize these commands so assays using them can be compiled and loaded onto devices.
+Firmware v72 adds two new BCODE commands (4 and 5) for sinusoidal stage motion.
 
 ## Error Without These Changes
-
-Loading an assay containing sinusoidal commands will fail with:
 
 ```
 {"status":"FAILURE","errorMessage":"Cannot read properties of undefined (reading 'params')"}
 ```
 
-This happens because `getBcodeCommand()` returns `undefined` for unrecognized command names, and then `compileInstruction()` tries to access `.params` on it.
-
 ## Changes Required
 
-### 1. Add command definitions to `bcodeCommands` array
-
-Add these two entries to the `bcodeCommands` array (after the existing `OSCILLATE STAGE` entry):
+### 1. Add to `bcodeCommands` array (after OSCILLATE STAGE)
 
 ```javascript
-{
+}, {
     num: '4',
     name: 'SINUSOIDAL OSCILLATE',
-    params: ['microns', 'period_ms', 'cycles'],
-    description: 'Oscillates with sinusoidal velocity profile. Period is full cycle time in milliseconds.'
+    params: ['microns', 'peak_delay_us', 'shape_pct', 'cycles'],
+    description: 'Oscillates with sinusoidal velocity profile. peak_delay_us = step delay at peak speed. shape_pct = 100 for pure sine, <100 wider, >100 narrower. Period is derived.'
 }, {
     num: '5',
     name: 'SINUSOIDAL MOVE',
-    params: ['microns', 'half_period_ms'],
-    description: 'Moves stage with sinusoidal velocity profile (one half-stroke). Half_period_ms is time for this move.'
+    params: ['microns', 'peak_delay_us', 'shape_pct'],
+    description: 'One half-stroke with sinusoidal velocity profile. Period is derived from peak_delay and shape.'
 }
 ```
 
-### 2. Add duration estimates to `instructionTime()`
-
-Add these cases to the `switch (command)` block in `instructionTime()`:
+### 2. Add to `instructionTime()` switch
 
 ```javascript
-case 'SINUSOIDAL OSCILLATE':
-    return parseInt(params.period_ms, 10) * parseInt(params.cycles, 10);
-case 'SINUSOIDAL MOVE':
-    return parseInt(params.half_period_ms, 10);
+case 'SINUSOIDAL OSCILLATE': {
+    const microns = Math.abs(parseInt(params.microns, 10));
+    const peakDelay = parseInt(params.peak_delay_us, 10);
+    const shape = parseInt(params.shape_pct, 10) / 100.0;
+    const cycles = parseInt(params.cycles, 10);
+    const N = Math.floor(microns / 25);
+    let sumInv = 0;
+    for (let i = 0; i < N; i++) {
+        sumInv += 1.0 / Math.pow(Math.sin(Math.PI * (i + 0.5) / N), shape);
+    }
+    return Math.floor(peakDelay * sumInv * 2 * cycles / 1000);
+}
+case 'SINUSOIDAL MOVE': {
+    const microns = Math.abs(parseInt(params.microns, 10));
+    const peakDelay = parseInt(params.peak_delay_us, 10);
+    const shape = parseInt(params.shape_pct, 10) / 100.0;
+    const N = Math.floor(microns / 25);
+    let sumInv = 0;
+    for (let i = 0; i < N; i++) {
+        sumInv += 1.0 / Math.pow(Math.sin(Math.PI * (i + 0.5) / N), shape);
+    }
+    return Math.floor(peakDelay * sumInv / 1000);
+}
 ```
 
 ## Assay JSON Format
-
-Once the middleware is updated, assays can use the new commands like this:
 
 ```json
 {
     "command": "Sinusoidal Oscillate",
     "params": {
-        "comment": "Smooth mix sample in well",
+        "comment": "Smooth mix in well",
         "microns": 3000,
-        "period_ms": 500,
-        "cycles": 100
+        "peak_delay_us": 500,
+        "shape_pct": 100,
+        "cycles": 10
     }
 }
 ```
@@ -65,36 +75,29 @@ Once the middleware is updated, assays can use the new commands like this:
     "params": {
         "comment": "Smooth half-stroke forward",
         "microns": 3000,
-        "half_period_ms": 250
+        "peak_delay_us": 500,
+        "shape_pct": 100
     }
 }
 ```
 
-The `comment` field in params is optional and is stripped out during compilation (same as all other commands).
-
-## Compiled BCODE Output
-
-The middleware compiler will produce these BCODE strings:
-
-- Sinusoidal Oscillate: `4,3000,500,100:`
-- Sinusoidal Move: `5,3000,250:`
-
 ## Parameter Reference
 
-| Command | Param | Description |
-|---|---|---|
-| Sinusoidal Oscillate | microns | Half-stroke amplitude in microns |
-| Sinusoidal Oscillate | period_ms | Time for one full back-and-forth cycle (ms) |
-| Sinusoidal Oscillate | cycles | Number of full oscillation cycles |
-| Sinusoidal Move | microns | Distance to move (positive = distal, negative = proximal) |
-| Sinusoidal Move | half_period_ms | Time for this single half-stroke (ms) |
+| Param | Description |
+|---|---|
+| microns | Half-stroke distance in microns |
+| peak_delay_us | Step delay at peak velocity (us). 350 = safe motor limit, 500+ = conservative |
+| shape_pct | Shape as percentage. 100 = pure sine, 50 = wider/flatter, 150 = narrower peak |
+| cycles | Number of full back-and-forth oscillation cycles |
 
 ## How It Works
 
-Unlike the existing square-wave oscillate (cmd 3) which moves at constant speed with instant reversals, the sinusoidal commands produce smooth acceleration/deceleration. The stage position follows a cosine profile, resulting in zero velocity at reversal points and peak velocity at the midpoint of each stroke. The firmware precomputes per-step delays using `acos()` to achieve a true sinusoidal position profile.
+Velocity vs position follows: `v(x) = v_max * sin(pi * x / D) ^ (shape_pct / 100)`
 
-A Python simulation tool is available at `firmware/sinusoidal_sim.py` to preview motion profiles before deploying:
+The period is NOT an input — it is derived from peak_delay and shape. Narrower shapes (>100) produce longer periods because the endpoint steps are slower. Use the simulation tool to preview:
 
 ```
-python sinusoidal_sim.py 3000 250 -c 3
+python sinusoidal_sim.py 3000 500              # pure sine (shape=1.0)
+python sinusoidal_sim.py 3000 500 -s 0.75      # wider peak
+python sinusoidal_sim.py 3000 500 --compare    # compare shapes
 ```

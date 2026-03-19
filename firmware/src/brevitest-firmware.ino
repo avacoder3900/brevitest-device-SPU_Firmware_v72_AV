@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(72);
+PRODUCT_VERSION(73);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -1110,13 +1110,15 @@ void oscillate_stage(int amplitude, int step_delay, int cycles, bool inBCODE)
 /**
  * @brief Move stage with sinusoidal velocity profile (one half-stroke)
  *
- * Position follows x(t) = D/2 * (1 - cos(pi*t/T)), producing smooth
- * acceleration from rest, peak velocity at midpoint, deceleration to rest.
+ * Velocity vs position follows: v(x) = v_max * sin(pi * x / D) ^ shape
+ * v_max is determined by peak_delay_us (step delay at the midpoint).
+ * The period is derived — not an input.
  *
  * @param microns Distance to move (positive = distal, negative = proximal)
- * @param half_period_ms Time for this half-stroke in milliseconds
+ * @param peak_delay_us Step delay at peak velocity in microseconds
+ * @param shape_pct Shape as percentage (100 = pure sine, >100 = narrower, <100 = wider)
  */
-void move_stage_sinusoidal(int microns, int half_period_ms)
+void move_stage_sinusoidal(int microns, int peak_delay_us, int shape_pct)
 {
     int abs_microns, N, dir;
 
@@ -1144,19 +1146,18 @@ void move_stage_sinusoidal(int microns, int half_period_ms)
     }
 
     // Precompute phase delays for sinusoidal velocity profile
-    // Time at step i: t_i = T/pi * acos(1 - 2*i/N)
-    // Total time per step: t_{i+1} - t_i
-    // Phase delay (per HIGH/LOW phase): step_time / 2
+    // v(x) = v_max * sin(pi * x / D) ^ shape
+    // v_max = step_size / (2 * peak_delay_us)
+    // phase_delay_i = peak_delay_us / sin(pi * (i+0.5) / N) ^ shape
     static int delays[SINUSOIDAL_MAX_STEPS];
-    float T_half_us = half_period_ms * 1000.0f;
+    float shape = shape_pct / 100.0f;
     int clamped_count = 0;
 
     for (int i = 0; i < N; i++)
     {
-        float theta_i = acosf(1.0f - 2.0f * (float)i / (float)N);
-        float theta_next = acosf(1.0f - 2.0f * (float)(i + 1) / (float)N);
-        float step_time_us = (T_half_us / (float)M_PI) * (theta_next - theta_i);
-        int phase_delay = (int)(step_time_us / 2.0f);
+        float midpoint = ((float)i + 0.5f) / (float)N;
+        float sin_val = powf(sinf((float)M_PI * midpoint), shape);
+        int phase_delay = (int)((float)peak_delay_us / sin_val);
         if (phase_delay < MOTOR_MINIMUM_STEP_DELAY)
         {
             phase_delay = MOTOR_MINIMUM_STEP_DELAY;
@@ -1184,23 +1185,23 @@ void move_stage_sinusoidal(int microns, int half_period_ms)
  * @brief Oscillate stage with sinusoidal velocity profile
  *
  * Full back-and-forth oscillation with smooth sinusoidal motion.
- * Each half-stroke follows a cosine position profile for jerk-free reversals.
+ * Velocity follows v(x) = v_max * sin(pi * x / D) ^ shape.
+ * Period is derived from peak_delay and shape.
  *
  * @param amplitude Distance of one half-stroke in microns
- * @param period_ms Time for one full cycle (back and forth) in milliseconds
+ * @param peak_delay_us Step delay at peak velocity in microseconds
+ * @param shape_pct Shape as percentage (100 = pure sine, >100 = narrower, <100 = wider)
  * @param cycles Number of full oscillation cycles
  * @param inBCODE If true, calls BCODE_loop() at each reversal for heater PID and cartridge detection
  */
-void oscillate_stage_sinusoidal(int amplitude, int period_ms, int cycles, bool inBCODE)
+void oscillate_stage_sinusoidal(int amplitude, int peak_delay_us, int shape_pct, int cycles, bool inBCODE)
 {
-    int half_period_ms = period_ms / 2;
-
     for (int i = 0; i < cycles; i++)
     {
-        move_stage_sinusoidal(amplitude, half_period_ms);
+        move_stage_sinusoidal(amplitude, peak_delay_us, shape_pct);
         if (inBCODE)
             BCODE_loop();
-        move_stage_sinusoidal(-amplitude, half_period_ms);
+        move_stage_sinusoidal(-amplitude, peak_delay_us, shape_pct);
         if (inBCODE)
             BCODE_loop();
         if (device_state.test_state == TestState::CANCELLED)
@@ -3067,18 +3068,20 @@ int process_one_BCODE_command(int cmd, int index)
         Log.info("Oscillate %d microns, %d µs, %d cycles", param1, param2, param3);
         oscillate_stage(param1, param2, param3, true);
         break;
-    case 4:                                      // Sinusoidal Oscillate(microns, period_ms, cycles)
+    case 4:                                      // Sinusoidal Oscillate(microns, peak_delay_us, shape_pct, cycles)
         index = get_BCODE_token(index, &param1); // microns amplitude
-        index = get_BCODE_token(index, &param2); // period_ms (full cycle)
-        index = get_BCODE_token(index, &param3); // number of cycles
-        Log.info("Sinusoidal oscillate %d microns, %d ms period, %d cycles", param1, param2, param3);
-        oscillate_stage_sinusoidal(param1, param2, param3, true);
+        index = get_BCODE_token(index, &param2); // peak_delay_us
+        index = get_BCODE_token(index, &param3); // shape_pct (100 = pure sine)
+        index = get_BCODE_token(index, &param4); // number of cycles
+        Log.info("Sinusoidal oscillate %d um, %d us peak, shape %d%%, %d cycles", param1, param2, param3, param4);
+        oscillate_stage_sinusoidal(param1, param2, param3, param4, true);
         break;
-    case 5:                                      // Sinusoidal Move(microns, half_period_ms)
+    case 5:                                      // Sinusoidal Move(microns, peak_delay_us, shape_pct)
         index = get_BCODE_token(index, &param1); // microns (positive or negative)
-        index = get_BCODE_token(index, &param2); // half_period_ms
-        Log.info("Sinusoidal move %d microns, %d ms", param1, param2);
-        move_stage_sinusoidal(param1, param2);
+        index = get_BCODE_token(index, &param2); // peak_delay_us
+        index = get_BCODE_token(index, &param3); // shape_pct (100 = pure sine)
+        Log.info("Sinusoidal move %d um, %d us peak, shape %d%%", param1, param2, param3);
+        move_stage_sinusoidal(param1, param2, param3);
         break;
     case 10:                                     // Set sensor params
         index = get_BCODE_token(index, &param1); // gain
