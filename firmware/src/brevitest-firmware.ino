@@ -855,9 +855,15 @@ void testFCCCompliance()
 bool fcc_worst_case_running = false;
 unsigned long fcc_motor_last_step = 0;
 unsigned long fcc_buzzer_last_toggle = 0;
+unsigned long fcc_heater_last_check = 0;
 bool fcc_buzzer_on = false;
+bool fcc_heater_active = false;
 int fcc_motor_direction = LOW;
 unsigned long fcc_motor_steps = 0;
+
+#define FCC_HEATER_MAX_TEMP 500        // 50.0°C in 10ths of a degree
+#define FCC_HEATER_RESUME_TEMP 450     // 45.0°C — resume heating (hysteresis)
+#define FCC_HEATER_CHECK_INTERVAL 500  // check temp every 500ms
 
 void startFCCWorstCase()
 {
@@ -882,9 +888,11 @@ void startFCCWorstCase()
     fcc_motor_last_step = micros();
     Serial.println("  ✓ Motor awake — oscillating");
 
-    // 3. Heater at max power (no thermal control loop)
+    // 3. Heater at max power WITH thermal cutoff at 50°C
     analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
-    Serial.println("  ✓ Heater at MAX power (PWM 255 @ 150 Hz)");
+    fcc_heater_active = true;
+    fcc_heater_last_check = millis();
+    Serial.println("  ✓ Heater at MAX power (capped at 50°C)");
 
     // 4. All LEDs/lasers ON at full power
     analogWrite(pinLaserA, 255);
@@ -923,6 +931,7 @@ void stopFCCWorstCase()
 
     // Stop heater
     analogWrite(pinHeater, 0);
+    fcc_heater_active = false;
 
     // Stop LEDs
     analogWrite(pinLaserA, 0);
@@ -973,8 +982,29 @@ void updateFCCWorstCase()
         }
     }
 
-    // Pulse buzzer: 500ms on, 500ms off
+    // Thermal management: cap heater at 50°C with hysteresis
     unsigned long now_ms = millis();
+    if (now_ms - fcc_heater_last_check >= FCC_HEATER_CHECK_INTERVAL)
+    {
+        fcc_heater_last_check = now_ms;
+        int raw = analogRead(pinHeaterThermistor);
+        int temp = raw_table_lookup(raw);  // returns 10ths of °C
+
+        if (fcc_heater_active && temp >= FCC_HEATER_MAX_TEMP)
+        {
+            analogWrite(pinHeater, 0);
+            fcc_heater_active = false;
+            Serial.printf("  ⚡ Heater OFF — reached %.1f°C (limit 50°C)\n", temp / 10.0);
+        }
+        else if (!fcc_heater_active && temp <= FCC_HEATER_RESUME_TEMP)
+        {
+            analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
+            fcc_heater_active = true;
+            Serial.printf("  🔥 Heater ON — cooled to %.1f°C (resuming)\n", temp / 10.0);
+        }
+    }
+
+    // Pulse buzzer: 500ms on, 500ms off
     if (now_ms - fcc_buzzer_last_toggle >= 500)
     {
         fcc_buzzer_last_toggle = now_ms;
