@@ -698,13 +698,14 @@ void startFCCWorstCase()
     enableAllRadios();
     Serial.println("  ✓ All radios ON (WiFi + Cellular + BLE)");
 
-    // 2. Wake motor and start oscillating
+    // 2. Wake motor, home it, then start oscillating
     wake_motor();
-    digitalWrite(pinMotorDir, LOW);
-    fcc_motor_direction = LOW;
-    fcc_motor_steps = 0;
+    Serial.println("  ⏳ Homing motor to proximal limit...");
+    move_stage_until_proximal_limit(MOTOR_RESET_STEP_DELAY);
+    Serial.println("  ✓ Motor homed — starting oscillation");
+    fcc_motor_direction = LOW; // start moving distal
+    digitalWrite(pinMotorDir, fcc_motor_direction);
     fcc_motor_last_step = micros();
-    Serial.println("  ✓ Motor awake — oscillating");
 
     // 3. Heater at max power WITH thermal cutoff at 50°C
     analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
@@ -781,23 +782,49 @@ void updateFCCWorstCase()
     if (!fcc_worst_case_running)
         return;
 
-    // Oscillate motor: step every MOTOR_MINIMUM_STEP_DELAY microseconds
-    // Reverse direction every 2000 steps (~50mm travel)
+    // Oscillate motor: continuously back and forth on the linear rail
+    // Uses limit switch (proximal) and STAGE_POSITION_LIMIT (distal)
+    // Direction HIGH = toward limit switch (proximal/home)
+    // Direction LOW  = away from limit switch (distal)
     unsigned long now_us = micros();
     if (now_us - fcc_motor_last_step >= (unsigned long)MOTOR_MINIMUM_STEP_DELAY)
     {
         fcc_motor_last_step = now_us;
+
+        // Check if we hit the proximal limit switch
+        if (fcc_motor_direction == HIGH && digitalRead(pinStageLimit) == LOW)
+        {
+            // Hit home — reverse to go distal
+            fcc_motor_direction = LOW;
+            digitalWrite(pinMotorDir, fcc_motor_direction);
+            stage_position = 0;
+            Serial.println("  ↔ Motor reversed (hit proximal limit)");
+            return; // skip this step, let direction settle
+        }
+
+        // Check if we hit the distal end
+        if (fcc_motor_direction == LOW && stage_position >= STAGE_POSITION_LIMIT)
+        {
+            // Hit far end — reverse to go proximal
+            fcc_motor_direction = HIGH;
+            digitalWrite(pinMotorDir, fcc_motor_direction);
+            Serial.println("  ↔ Motor reversed (hit distal limit)");
+            return;
+        }
+
+        // Take a step
         digitalWrite(pinMotorStep, HIGH);
         delayMicroseconds(2);
         digitalWrite(pinMotorStep, LOW);
-        fcc_motor_steps++;
 
-        if (fcc_motor_steps >= 2000)
-        {
-            fcc_motor_steps = 0;
-            fcc_motor_direction = (fcc_motor_direction == LOW) ? HIGH : LOW;
-            digitalWrite(pinMotorDir, fcc_motor_direction);
-        }
+        // Track position
+        if (fcc_motor_direction == HIGH)
+            stage_position -= MOTOR_MICRONS_PER_EIGHTH_STEP;
+        else
+            stage_position += MOTOR_MICRONS_PER_EIGHTH_STEP;
+
+        if (stage_position < 0)
+            stage_position = 0;
     }
 
     // Thermal management: cap heater at 50°C with hysteresis
