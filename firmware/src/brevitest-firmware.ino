@@ -611,42 +611,7 @@ void enableAllRadios()
     radios.bluetooth = true;
 }
 
-void testWiFiOnly()
-{
-    Serial.println("➜ TEST MODE: WiFi Only");
-    disableAllRadios();
-    delay(500);
-    WiFi.on();
-    radios.wifi = true;
-    Serial.println("✓ WiFi ON, All others OFF");
-}
 
-void testCellularOnly()
-{
-    Serial.println("➜ TEST MODE: Cellular Only");
-    disableAllRadios();
-    delay(500);
-    Cellular.on();
-    radios.cellular = true;
-    Serial.println("✓ Cellular ON, All others OFF");
-}
-
-void testBluetoothOnly()
-{
-    Serial.println("➜ TEST MODE: Bluetooth Only");
-    disableAllRadios();
-    delay(500);
-    BLE.on();
-    radios.bluetooth = true;
-    Serial.println("✓ Bluetooth ON, All others OFF");
-}
-
-void testFCCCompliance()
-{
-    Serial.println("➜ TEST MODE: FCC Compliance (All Radios)");
-    enableAllRadios();
-    Serial.println("✓ WiFi, Cellular, and Bluetooth ON");
-}
 
 // ─── FCC WORST-CASE EMISSION TEST ───────────────────────────
 // Runs all noisy peripherals simultaneously to find peak
@@ -691,12 +656,13 @@ void startFCCWorstCase()
     Serial.println("╠════════════════════════════════════════════════════╣");
     Serial.println("║  ⚠️  DO NOT INSERT CARTRIDGE                       ║");
     Serial.println("║  ⚠️  SUPERVISED LAB USE ONLY                       ║");
-    Serial.println("║  ⚠️  Send 8505 to stop                             ║");
+    Serial.println("║  ⚠️  Send 8501 to stop                             ║");
     Serial.println("╚════════════════════════════════════════════════════╝");
 
-    // 1. Enable all radios
-    enableAllRadios();
-    Serial.println("  ✓ All radios ON (WiFi + Cellular + BLE)");
+    // 1. Radios OFF — unintentional radiator test only
+    //    Use 8901 separately if lab needs radios on
+    disableAllRadios();
+    Serial.println("  ✓ All radios OFF (unintentional radiator test)");
 
     // 2. Wake motor, home it, then start oscillating
     wake_motor();
@@ -738,7 +704,7 @@ void startFCCWorstCase()
     Serial.println("\n  ▶ WORST-CASE EMISSION MODE ACTIVE");
     Serial.println("    All peripherals running simultaneously.");
     Serial.println("    Test lab can now measure peak emissions.");
-    Serial.println("    Send command 8505 to stop.\n");
+    Serial.println("    Send command 8501 to stop.\n");
 }
 
 void stopFCCWorstCase()
@@ -931,18 +897,15 @@ void displayHelp()
     Serial.println("║   8300 - Bluetooth OFF                ║");
     Serial.println("║   8301 - Bluetooth ON                 ║");
     Serial.println("║                                       ║");
-    Serial.println("║ TEST MODES:                           ║");
-    Serial.println("║   8500 - Test WiFi only               ║");
-    Serial.println("║   8501 - Test Cellular only           ║");
-    Serial.println("║   8502 - Test Bluetooth only          ║");
-    Serial.println("║   8503 - FCC compliance (all radios)  ║");
-    Serial.println("║   8504 - WORST-CASE emission test     ║");
-    Serial.println("║   8505 - Stop worst-case test         ║");
+    Serial.println("║ FCC EMISSION TEST:                    ║");
+    Serial.println("║   8500 - Worst-case emission test     ║");
+    Serial.println("║          (all peripherals, radios OFF)║");
+    Serial.println("║   8501 - Stop emission test           ║");
+    Serial.println("║   8502 - Emission check report        ║");
     Serial.println("║                                       ║");
-    Serial.println("║ MASTER CONTROL:                       ║");
+    Serial.println("║ RADIO CONTROL:                        ║");
     Serial.println("║   8900 - ALL radios OFF               ║");
     Serial.println("║   8901 - ALL radios ON                ║");
-    Serial.println("║   8999 - Emission check report        ║");
     Serial.println("╚═══════════════════════════════════════╝");
     Serial.println("\nType command number and press Enter");
 }
@@ -4068,33 +4031,16 @@ int particle_command(String arg)
         Serial.println("✓ ALL RADIOS ENABLED");
         break;
 
-    // ===== TEST MODES =====
+    // ===== FCC EMISSION TEST MODES =====
     case 8500:
-        testWiFiOnly();
-        break;
-
-    case 8501:
-        testCellularOnly();
-        break;
-
-    case 8502:
-        testBluetoothOnly();
-        break;
-
-    case 8503:
-        testFCCCompliance();
-        break;
-
-    case 8504:
         startFCCWorstCase();
         break;
 
-    case 8505:
+    case 8501:
         stopFCCWorstCase();
         break;
 
-    // ===== EMISSION CHECK =====
-    case 8999:
+    case 8502:
         emissionCheck();
         break;
 
