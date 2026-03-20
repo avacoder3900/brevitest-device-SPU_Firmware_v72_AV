@@ -802,8 +802,8 @@ void updateFCCWorstCase()
             return; // skip this step, let direction settle
         }
 
-        // Check if we hit the distal end
-        if (fcc_motor_direction == LOW && stage_position >= STAGE_POSITION_LIMIT)
+        // Check if we hit half the rail (22.5mm)
+        if (fcc_motor_direction == LOW && stage_position >= (STAGE_POSITION_LIMIT / 2))
         {
             // Hit far end — reverse to go proximal
             fcc_motor_direction = HIGH;
