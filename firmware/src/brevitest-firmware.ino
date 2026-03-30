@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(73);
+PRODUCT_VERSION(74);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2277,30 +2277,161 @@ void stop_temperature_control()
 /////////////////////////////////////////////////////////////
 
 /////////////////////////////////////////////////////
+//            DEVICE LOG UPLOAD (Build 1C)         //
+/////////////////////////////////////////////////////
+
+// Track whether a log upload is in progress (waiting for response)
+bool log_upload_pending = false;
+unsigned long log_upload_started = 0;
+#define LOG_UPLOAD_TIMEOUT_MS 30000
+#define LOG_UPLOAD_INTERVAL_MS 60000
+
+/**
+ * @brief Handle device-log webhook response from cloud
+ *
+ * Called when the middleware confirms it received (or failed to receive)
+ * the session log. On SUCCESS, delete the log file from flash.
+ * On FAILURE, leave the file for retry next idle cycle.
+ */
+void response_device_log(const char *event_name, const char *data)
+{
+    log_upload_pending = false;
+
+    if (data == NULL) {
+        device_log("device-log response: no data");
+        return;
+    }
+
+    Variant json = Variant::fromJSON(String(data));
+    String status = json.get("status").toString();
+
+    if (status == "SUCCESS") {
+        // Middleware received the log — safe to delete from flash
+        unlink("/log/session.old.txt");
+        device_log("Session log uploaded and deleted from flash");
+    } else {
+        // Upload failed — keep the file, will retry next cycle
+        String errorMessage = json.get("errorMessage").toString();
+        device_log("Session log upload failed: %s", errorMessage.length() > 0 ? errorMessage.c_str() : "unknown error");
+    }
+
+    flush_log_to_file();
+}
+
+/**
+ * @brief Attempt to upload the session log file to the cloud
+ *
+ * Called from the idle loop. Uploads /log/session.old.txt via the same
+ * CloudEvent + loadData() binary pattern used by upload-test.
+ *
+ * Flow:
+ *   1. Flush current RAM buffer to session.txt
+ *   2. Rotate session.txt → session.old.txt (so new logs go to a fresh file)
+ *   3. Upload session.old.txt as "device-log" event
+ *   4. On SUCCESS response (in response_device_log): delete session.old.txt
+ *   5. On FAILURE or timeout: leave file, retry next cycle
+ */
+void try_upload_session_log()
+{
+    // Don't attempt if already waiting for a response
+    if (log_upload_pending) {
+        if (millis() - log_upload_started > LOG_UPLOAD_TIMEOUT_MS) {
+            device_log("Session log upload timed out");
+            log_upload_pending = false;
+        }
+        return;
+    }
+
+    // Don't attempt if cloud event is busy or rate limited
+    if (event.isSending() || ((lastPublish != 0) && (millis() - lastPublish < publishPeriod.count()))) {
+        return;
+    }
+
+    // Don't attempt if not connected
+    if (!Particle.connected()) {
+        return;
+    }
+
+    // Check if there's a log file to upload
+    // First flush current buffer, then rotate so we upload a stable file
+    flush_log_to_file();
+
+    struct stat st;
+    if (stat("/log/session.txt", &st) != 0 || st.st_size == 0) {
+        return; // No log file or empty
+    }
+
+    // Rotate: session.txt → session.old.txt
+    // This way new device_log() calls during upload go to a fresh session.txt
+    unlink("/log/session.old.txt");
+    rename("/log/session.txt", "/log/session.old.txt");
+
+    // Load and publish
+    event.clear();
+    event.name("device-log");
+    event.contentType(ContentType::BINARY);
+    event.loadData("/log/session.old.txt");
+
+    if (event.data().size() == 0) {
+        device_log("Failed to load session log for upload");
+        return;
+    }
+
+    if (event.canPublish(event.size())) {
+        device_log("Uploading session log (%d bytes)", event.size());
+        lastPublish = millis();
+        log_upload_pending = true;
+        log_upload_started = millis();
+        Particle.publish(event);
+    } else {
+        device_log("Session log too large to publish (%d bytes)", event.size());
+    }
+}
+
+/////////////////////////////////////////////////////
 //            SUBSCRIPTION MANAGEMENT              //
 /////////////////////////////////////////////////////
 
 /**
  * @brief Register all Particle cloud subscriptions
- * 
+ *
  * This function registers all webhook response and error subscriptions.
  * Should be called during setup() and when connection is restored.
  */
+/**
+ * Unified webhook response dispatcher.
+ *
+ * All webhook responses arrive as: {device_id}/hook-response/{event_name}
+ * A single prefix subscription catches all of them, then we dispatch
+ * to the existing handler functions based on the event name.
+ *
+ * This uses 1 of 4 available Particle.subscribe() slots instead of 4,
+ * leaving room for future subscriptions.
+ */
+void response_webhook(const char *event_name, const char *data)
+{
+    if (strstr(event_name, "validate-cartridge")) {
+        response_validate_cartridge(event_name, data);
+    } else if (strstr(event_name, "load-assay")) {
+        response_load_assay(event_name, data);
+    } else if (strstr(event_name, "upload-test")) {
+        response_upload_test(event_name, data);
+    } else if (strstr(event_name, "reset-cartridge")) {
+        response_reset_cartridge(event_name, data);
+    } else if (strstr(event_name, "device-log")) {
+        response_device_log(event_name, data);
+    } else {
+        device_log("Unknown webhook response: %s", event_name);
+    }
+}
+
 void register_cloud_subscriptions()
 {
-    String validation_topic = String(device_id + "/hook-response/validate-cartridge/");
-    
-    // Success responses
-    bool sub1 = Particle.subscribe(String(device_id + "/hook-response/load-assay/"), response_load_assay);
-    bool sub2 = Particle.subscribe(validation_topic, response_validate_cartridge);
-    bool sub3 = Particle.subscribe(String(device_id + "/hook-response/reset-cartridge/"), response_reset_cartridge);
-    bool sub4 = Particle.subscribe(String(device_id + "/hook-response/upload-test/"), response_upload_test);
-    
-    // Log subscription status
-    Log.info("Subscriptions registered - Load: %s, Validate: %s, Reset: %s, Upload: %s",
-             sub1 ? "OK" : "FAIL", sub2 ? "OK" : "FAIL", sub3 ? "OK" : "FAIL", sub4 ? "OK" : "FAIL");
-    Log.info("Validation subscription: %s (topic: %s)", 
-             sub2 ? "OK" : "FAILED", validation_topic.c_str());
+    String topic = String(device_id + "/hook-response/");
+
+    bool sub = Particle.subscribe(topic, response_webhook);
+
+    device_log("Webhook subscription: %s (topic: %s)", sub ? "OK" : "FAIL", topic.c_str());
 }
 
 
@@ -5705,13 +5836,20 @@ void loop()
     case DeviceMode::IDLE:
         // === IDLE MODE ===
         // Wait for state changes from hardware_loop
-        // Periodically flush log buffer to file
+        // Periodically flush log buffer to file and attempt log upload
         {
             static unsigned long last_idle_flush = 0;
+            static unsigned long last_upload_attempt = 0;
             if (last_idle_flush == 0 || (millis() - last_idle_flush) >= LOG_FLUSH_IDLE_INTERVAL_MS)
             {
                 flush_log_to_file();
                 last_idle_flush = millis();
+            }
+            // Attempt session log upload every 60 seconds
+            if (last_upload_attempt == 0 || (millis() - last_upload_attempt) >= LOG_UPLOAD_INTERVAL_MS)
+            {
+                try_upload_session_log();
+                last_upload_attempt = millis();
             }
         }
         break;

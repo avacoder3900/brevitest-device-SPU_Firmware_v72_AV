@@ -20,7 +20,8 @@
       "Bash(xargs:*)",
       "WebFetch(domain:)",
       "Bash(pip install:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(npm install:*)"
     ]
   }
 }
