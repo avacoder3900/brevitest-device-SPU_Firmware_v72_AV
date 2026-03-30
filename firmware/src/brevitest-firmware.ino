@@ -2298,7 +2298,7 @@ void response_device_log(const char *event_name, const char *data)
     log_upload_pending = false;
 
     if (data == NULL) {
-        device_log("device-log response: no data");
+        Log.info("device-log response: no data");
         return;
     }
 
@@ -2308,11 +2308,11 @@ void response_device_log(const char *event_name, const char *data)
     if (status == "SUCCESS") {
         // Middleware received the log — safe to delete from flash
         unlink("/log/session.old.txt");
-        device_log("Session log uploaded and deleted from flash");
+        Log.info("Session log uploaded and deleted from flash");
     } else {
         // Upload failed — keep the file, will retry next cycle
         String errorMessage = json.get("errorMessage").toString();
-        device_log("Session log upload failed: %s", errorMessage.length() > 0 ? errorMessage.c_str() : "unknown error");
+        Log.info("Session log upload failed: %s", errorMessage.length() > 0 ? errorMessage.c_str() : "unknown error");
     }
 
     flush_log_to_file();
@@ -2336,7 +2336,7 @@ void try_upload_session_log()
     // Don't attempt if already waiting for a response
     if (log_upload_pending) {
         if (millis() - log_upload_started > LOG_UPLOAD_TIMEOUT_MS) {
-            device_log("Session log upload timed out");
+            Log.info("Session log upload timed out");
             log_upload_pending = false;
         }
         return;
@@ -2373,18 +2373,18 @@ void try_upload_session_log()
     event.loadData("/log/session.old.txt");
 
     if (event.data().size() == 0) {
-        device_log("Failed to load session log for upload");
+        Log.info("Failed to load session log for upload");
         return;
     }
 
     if (event.canPublish(event.size())) {
-        device_log("Uploading session log (%d bytes)", event.size());
+        Log.info("Uploading session log (%d bytes)", event.size());
         lastPublish = millis();
         log_upload_pending = true;
         log_upload_started = millis();
         Particle.publish(event);
     } else {
-        device_log("Session log too large to publish (%d bytes)", event.size());
+        Log.info("Session log too large to publish (%d bytes)", event.size());
     }
 }
 
