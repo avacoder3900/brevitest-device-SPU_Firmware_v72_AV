@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(75);
+PRODUCT_VERSION(76);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2443,6 +2443,8 @@ void try_upload_session_log()
  */
 void response_webhook(const char *event_name, const char *data)
 {
+    device_log("Webhook response: %s (data len: %d)", event_name, data ? (int)strlen(data) : 0);
+
     if (strstr(event_name, "validate-cartridge")) {
         response_validate_cartridge(event_name, data);
     } else if (strstr(event_name, "load-assay")) {
@@ -4288,11 +4290,18 @@ int test_runner(String cartridgeId)
     }
 }
 
+// Deferred load-assay: cloud function sets the ID, main loop publishes
+String deferred_assay_id = "";
+
 int load_assay(String assayId)
 {
     if (assayId.length() == ASSAY_UUID_LENGTH)
     {
-        publish_load_assay(assayId);
+        // Don't publish from inside the cloud function — Particle may not
+        // deliver the webhook response while a cloud function is executing.
+        // Instead, set a flag and let the main loop handle the publish.
+        deferred_assay_id = assayId;
+        device_log("Load assay requested: %s (deferred to main loop)", assayId.c_str());
         return 0;
     }
     else
@@ -4320,12 +4329,16 @@ int verify_assay(String assayId)
     return -1;
 }
 
+// Deferred reset-cartridge: cloud function sets the flag, main loop publishes
+bool deferred_reset_cartridge = false;
+
 int reset_cartridge(String cartridgeId)
 {
     if (cartridgeId.length() == BARCODE_UUID_LENGTH)
     {
         memcpy(reset_uuid, cartridgeId.c_str(), BARCODE_UUID_LENGTH + 1);
-        publish_reset_cartridge();
+        deferred_reset_cartridge = true;
+        device_log("Reset cartridge requested: %s (deferred to main loop)", cartridgeId.c_str());
         return 0;
     }
     else
@@ -5875,6 +5888,18 @@ void loop()
         // Wait for state changes from hardware_loop
         // Periodically flush log buffer to file and attempt log upload
         {
+            // Handle deferred publishes from cloud functions
+            // Publishing inside a cloud function context prevents Particle
+            // from delivering the webhook response back to the device.
+            if (deferred_assay_id.length() > 0) {
+                publish_load_assay(deferred_assay_id);
+                deferred_assay_id = "";
+            }
+            if (deferred_reset_cartridge) {
+                deferred_reset_cartridge = false;
+                publish_reset_cartridge();
+            }
+
             static unsigned long last_idle_flush = 0;
             static unsigned long last_upload_attempt = 0;
             if (last_idle_flush == 0 || (millis() - last_idle_flush) >= LOG_FLUSH_IDLE_INTERVAL_MS)
