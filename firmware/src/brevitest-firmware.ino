@@ -2366,11 +2366,41 @@ void try_upload_session_log()
     unlink("/log/session.old.txt");
     rename("/log/session.txt", "/log/session.old.txt");
 
+    // Prepend a metadata header to the upload file so the middleware can
+    // extract firmware version, boot count, etc. without relying on the
+    // session header being present in every chunk.
+    {
+        int fd = open("/log/upload.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd >= 0) {
+            char header[256];
+            int len = snprintf(header, sizeof(header),
+                "0|======== UPLOAD METADATA ========\n"
+                "0|Boot #%d | Device: %s\n"
+                "0|Firmware: v%d | Format: v%d\n"
+                "0|================================\n",
+                eeprom.cp_boot_count, device_id.c_str(),
+                FIRMWARE_VERSION, DATA_FORMAT_VERSION);
+            write(fd, header, len);
+
+            // Append the actual log content
+            int src = open("/log/session.old.txt", O_RDONLY);
+            if (src >= 0) {
+                char buf[512];
+                int n;
+                while ((n = read(src, buf, sizeof(buf))) > 0) {
+                    write(fd, buf, n);
+                }
+                close(src);
+            }
+            close(fd);
+        }
+    }
+
     // Load and publish
     event.clear();
     event.name("device-log");
     event.contentType(ContentType::BINARY);
-    event.loadData("/log/session.old.txt");
+    event.loadData("/log/upload.txt");
 
     if (event.data().size() == 0) {
         Log.info("Failed to load session log for upload");
@@ -2386,6 +2416,9 @@ void try_upload_session_log()
     } else {
         Log.info("Session log too large to publish (%d bytes)", event.size());
     }
+
+    // Clean up temp file
+    unlink("/log/upload.txt");
 }
 
 /////////////////////////////////////////////////////
