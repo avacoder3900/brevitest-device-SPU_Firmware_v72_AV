@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(76);
+PRODUCT_VERSION(77);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -4993,12 +4993,22 @@ void setup()
     init_digital_pin(pinMotorStep, OUTPUT, LOW);
     init_digital_pin(pinMotorDir, OUTPUT, LOW);
 
-    // === DEVICE ID AND LOGGING ===
-    device_id = System.deviceID();
-    Log.info("Device ID: %s", device_id.c_str());
-
-    // === PARTICLE CLOUD VARIABLES ===
+    // === PARTICLE CLOUD CONNECTION ===
     waitFor(Particle.connected, 20000);
+
+    // === DEVICE ID ===
+    // Set device_id AFTER cloud connects. On some OTA reboot paths,
+    // System.deviceID() returns empty if called too early.
+    device_id = System.deviceID();
+    if (device_id.length() == 0) {
+        // If still empty, delay briefly and retry — hardware ID should always be available
+        delay(1000);
+        device_id = System.deviceID();
+    }
+    if (device_id.length() == 0) {
+        Log.error("CRITICAL: device_id is empty after retries — webhook responses will not be received");
+    }
+    Log.info("Device ID: %s (length: %d)", device_id.c_str(), device_id.length());
     Particle.variable("temperature", current_temperature);
     Particle.variable("magnet_validation", magnet_validation_data);
 

@@ -240,7 +240,7 @@ const bcodeCompile = (bcodeArray) => {
         } else if (cmd === 'REPEAT') {
             return compiledCode + compileRepeatBegin(bcode.count) + bcodeCompile(bcode.code) + compileRepeatEnd();
         } else {
-            return compiledCode + compileInstruction(cmd, bcode.params);
+            return compiledCode + compileInstruction(cmd, bcode.params || {});
         }
     }, '');
 };
