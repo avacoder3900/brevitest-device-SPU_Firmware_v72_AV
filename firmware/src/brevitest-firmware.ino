@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(74);
+PRODUCT_VERSION(75);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2832,6 +2832,10 @@ void response_load_assay(const char *event_name, const char *data)
     int index = limit(name.substring(name.length() - 1).toInt(), PARTICLE_PAYLOAD_BUFFER_SIZE - 1, 0);
     Log.info("response_load_assay data size: %d, index: %d", data_len, index);
 
+    // Clear stale buffer data when first chunk of a new response arrives
+    if (index == 0) {
+        clear_payload_buffer();
+    }
     payload_buffer[index] = String(data);
     if (!all_payloads_received())
     {

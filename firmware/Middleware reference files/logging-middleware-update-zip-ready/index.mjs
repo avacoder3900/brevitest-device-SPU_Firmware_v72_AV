@@ -887,18 +887,14 @@ export const handler = async (event, context) => {
         console.log('body', body.data?.length ?? null, typeof body?.data, body?.data ?? '');
         const device = await getDevice(body.device_id);
 
-        // Archive every incoming Particle event (best-effort, non-blocking)
-        try {
-            await db.saveDeviceEvent({
-                deviceId: body.device_id || body.coreid,
-                eventName: body.event,
-                data: body.data,
-                publishedAt: body.published_at ? new Date(body.published_at) : new Date(),
-                archivedAt: new Date()
-            });
-        } catch (err) {
-            console.error('Event archiving failed (non-fatal):', err.message);
-        }
+        // Archive every incoming Particle event (fire-and-forget, never blocks handler)
+        db.saveDeviceEvent({
+            deviceId: body.device_id || body.coreid,
+            eventName: body.event,
+            data: body.data,
+            publishedAt: body.published_at ? new Date(body.published_at) : new Date(),
+            archivedAt: new Date()
+        }).catch(err => console.error('Event archiving failed (non-fatal):', err.message));
 
         if (!device || !device.id) {
             response = await send_response(body.coreid, body.event, 'ERROR', { errorMessage: 'Missing device' });
@@ -940,17 +936,17 @@ export const handler = async (event, context) => {
                     break;
             }
 
-            // Write enhanced webhook log for all events (device-log does its own)
+            // Write enhanced webhook log for all events (fire-and-forget, device-log does its own)
             if (body.event !== 'device-log') {
                 const responseBody = response?.body ? JSON.parse(response.body) : {};
-                await write_webhook_log(
+                write_webhook_log(
                     device.id,
                     body.event,
                     requestContext,
                     responseBody.status || 'UNKNOWN',
                     responseBody,
                     startTime
-                );
+                ).catch(err => console.error('Webhook log write failed (non-fatal):', err.message));
             }
         }
     } else {
