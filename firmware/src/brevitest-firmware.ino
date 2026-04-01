@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(77);
+PRODUCT_VERSION(78);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2236,8 +2236,26 @@ int pid_controller()
             {
                 dt = heater.read_time - prev_read_time;
                 error = heater.target_C_10X - heater.temp_C_10X;
-                heater.integral += (error * dt) / 1000;
+
+                // Compute raw output from P + I + D
                 derivative = (1000 * (error - heater.previous_error)) / dt;
+                output = (heater.k_p_num * error) / heater.k_p_den;
+                output += (heater.k_i_num * heater.integral) / heater.k_i_den;
+                output += (heater.k_d_num * derivative) / heater.k_d_den;
+
+                // Conditional integration: only accumulate integral when output is
+                // within actuator range. Prevents windup during heating ramp when
+                // output is saturated at 255, while allowing a higher Ki for
+                // faster steady-state error correction.
+                if (output > 0 && output < HEATER_MAX_POWER) {
+                    heater.integral += (error * dt) / 1000;
+                }
+
+                // Anti-windup: clamp integral so its contribution can't exceed output range
+                int max_integral = (HEATER_MAX_POWER * heater.k_i_den) / heater.k_i_num;
+                heater.integral = limit(heater.integral, max_integral, -max_integral);
+
+                // Recompute output with updated integral
                 output = (heater.k_p_num * error) / heater.k_p_den;
                 output += (heater.k_i_num * heater.integral) / heater.k_i_den;
                 output += (heater.k_d_num * derivative) / heater.k_d_den;
@@ -5525,8 +5543,8 @@ void hardware_loop()
     // === HEATER TEMPERATURE MONITORING ===
     previous_heater_ready = heater_ready;
     int temp_delta = heater.target_C_10X - heater.temp_C_10X;
-    // Check that temperature is within range AND positive (temp must be below target)
-    heater_ready = (temp_delta >= 0 && temp_delta < HEATER_READY_TEMP_DELTA);
+    // Check that temperature is within range (allows small overshoot above target)
+    heater_ready = (abs(temp_delta) < HEATER_READY_TEMP_DELTA);
     device_state.heater_ready = heater_ready;
 
     // Log heater_ready state changes (serial only — flash log captures 0.5°C threshold changes instead)

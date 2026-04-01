@@ -7,7 +7,7 @@
 // GLOBAL VARIABLES AND DEFINES
 
 // general constants
-#define FIRMWARE_VERSION 77
+#define FIRMWARE_VERSION 78
 #define DATA_FORMAT_VERSION 40
 
 #define TEST_DATA_FORMAT_CODE 'J'
@@ -20,6 +20,7 @@
 #define ARG_DELIM ','
 #define ATTR_DELIM ':'
 #define ITEM_DELIM '|'
+
 #define END_DELIM '#'
 #define SERIAL_COMMAND_BUFFER_SIZE 40
 
@@ -348,7 +349,7 @@ struct HeatingElement
         k_p_num = 80;
         k_p_den = 4;
         k_i_num = 1;
-        k_i_den = 50000;
+        k_i_den = 10;
         k_d_num = 1;
         k_d_den = 5;
     }
