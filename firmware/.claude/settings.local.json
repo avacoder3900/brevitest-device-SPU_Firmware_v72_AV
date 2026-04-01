@@ -21,7 +21,8 @@
       "WebFetch(domain:)",
       "Bash(pip install:*)",
       "Bash(python:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "WebFetch(domain:particle.io)"
     ]
   }
 }

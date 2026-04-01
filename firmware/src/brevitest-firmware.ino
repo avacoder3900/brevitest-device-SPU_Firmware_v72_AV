@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(78);
+PRODUCT_VERSION(79);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -2302,7 +2302,9 @@ void stop_temperature_control()
 bool log_upload_pending = false;
 unsigned long log_upload_started = 0;
 #define LOG_UPLOAD_TIMEOUT_MS 30000
-#define LOG_UPLOAD_INTERVAL_MS 60000
+
+// Deferred log upload: cloud function sets this flag, main loop publishes
+bool deferred_log_upload = false;
 
 /**
  * @brief Handle device-log webhook response from cloud
@@ -3959,6 +3961,12 @@ int particle_command(String arg)
         clear_all_logs();
         result = 1;
         break;
+    case 414: // upload session log to cloud (on-demand)
+        flush_log_to_file();
+        deferred_log_upload = true;
+        Log.info("Session log upload queued");
+        result = 1;
+        break;
     // ===== COMMUNICATION COMMANDS =====
     case 8000:
         displayHelp();
@@ -4725,6 +4733,42 @@ int upload_test_results(String params)
     return 1; // Success - upload started
 }
 
+/**
+ * @brief Upload session log to cloud (on-demand)
+ *
+ * Particle Cloud function to trigger a one-time upload of the session log.
+ * Replaces the previous automatic periodic upload to conserve data operations.
+ * Also available as serial command 414.
+ *
+ * @param params "?" for help, "" to trigger upload
+ * @return 1 if upload queued, 0 if no log to upload, -1 for help
+ */
+int upload_session_log(String params)
+{
+    if (params == "?" || params == "help" || params == "h") {
+        Particle.publish("upload_log_help",
+            "upload_log: Uploads session log to cloud. "
+            "Flushes RAM buffer to flash, then uploads. "
+            "Also available as serial command 414.",
+            PRIVATE);
+        return -1;
+    }
+
+    flush_log_to_file();
+
+    struct stat st;
+    if (stat("/log/session.txt", &st) != 0 || st.st_size == 0) {
+        Particle.publish("upload_log_result", "No log data to upload", PRIVATE);
+        return 0;
+    }
+
+    deferred_log_upload = true;
+    Particle.publish("upload_log_result",
+                    String::format("Log upload queued (%ld bytes)", st.st_size), PRIVATE);
+    device_log("Session log upload requested via cloud function");
+    return 1;
+}
+
 /////////////////////////////////////////////////////////////
 //                                                         //
 //                           TESTS                         //
@@ -5045,6 +5089,7 @@ void setup()
     Particle.function("force_state", force_state_transition);
     Particle.function("get_barcode_hist", get_barcode_history);
     Particle.function("upload_test", upload_test_results);
+    Particle.function("upload_log", upload_session_log);
 
     // === PARTICLE CLOUD SUBSCRIPTIONS ===
     register_cloud_subscriptions();
@@ -5929,17 +5974,16 @@ void loop()
             }
 
             static unsigned long last_idle_flush = 0;
-            static unsigned long last_upload_attempt = 0;
             if (last_idle_flush == 0 || (millis() - last_idle_flush) >= LOG_FLUSH_IDLE_INTERVAL_MS)
             {
                 flush_log_to_file();
                 last_idle_flush = millis();
             }
-            // Attempt session log upload every 60 seconds
-            if (last_upload_attempt == 0 || (millis() - last_upload_attempt) >= LOG_UPLOAD_INTERVAL_MS)
+            // Handle deferred log upload (triggered via cloud function or serial command)
+            if (deferred_log_upload)
             {
+                deferred_log_upload = false;
                 try_upload_session_log();
-                last_upload_attempt = millis();
             }
         }
         break;
