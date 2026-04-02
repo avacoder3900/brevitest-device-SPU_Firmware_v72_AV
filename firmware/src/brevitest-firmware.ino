@@ -1536,7 +1536,8 @@ int load_latest_magnet_validation(bool serial_output = true)
             Log.error("Failed to open latest validation file: %s, errno: %d", magnet_validation_filename.c_str(), errno);
             return -1;
         }
-        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE);
+        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE - 1);
+        magnet_validation_data[bytes_read] = '\0';
         close(fd);
         device_log("Latest validation file: %s, bytes: %d", magnet_validation_filename.c_str(), bytes_read);
         if (serial_output)
@@ -1604,6 +1605,62 @@ int clear_validation_files()
     closedir(validation);
     magnet_validation_data[0] = '\0';
     return count;
+}
+
+void cleanup_old_validation_files(int keep_count)
+{
+    // Collect all timestamps
+    DIR *validation = opendir("/validation");
+    int timestamps[MAGNETOMETER_MAX_FILES];
+    int count = 0;
+    do
+    {
+        validation_entry = readdir(validation);
+        if (validation_entry == NULL) break;
+        if (validation_entry->d_type != DT_REG) continue;
+        String filename = String(validation_entry->d_name);
+        int timestamp = filename.substring(7, filename.length() - 4).toInt();
+        if (timestamp > 0 && count < MAGNETOMETER_MAX_FILES)
+        {
+            timestamps[count++] = timestamp;
+        }
+    } while (validation_entry != NULL);
+    closedir(validation);
+
+    if (count <= keep_count) return;
+
+    // Sort ascending (bubble sort — small array)
+    for (int i = 0; i < count - 1; i++)
+    {
+        for (int j = 0; j < count - i - 1; j++)
+        {
+            if (timestamps[j] > timestamps[j + 1])
+            {
+                int tmp = timestamps[j];
+                timestamps[j] = timestamps[j + 1];
+                timestamps[j + 1] = tmp;
+            }
+        }
+    }
+
+    // Delete the oldest (count - keep_count) files
+    int to_delete = count - keep_count;
+    for (int i = 0; i < to_delete; i++)
+    {
+        String filepath = magnet_file_path + String(timestamps[i]) + ".txt";
+        if (unlink(filepath) == 0)
+        {
+            device_log("Cleaned old validation file: %s", filepath.c_str());
+        }
+    }
+    device_log("Validation cleanup: deleted %d, kept %d", to_delete, keep_count);
+}
+
+int reload_magnet_validation(String arg)
+{
+    int bytes = load_latest_magnet_validation(false);
+    device_log("reload_mag: reloaded %d bytes", bytes);
+    return bytes;
 }
 
 int create_magnet_validation_file()
@@ -5090,6 +5147,7 @@ void setup()
     Particle.function("get_barcode_hist", get_barcode_history);
     Particle.function("upload_test", upload_test_results);
     Particle.function("upload_log", upload_session_log);
+    Particle.function("reload_mag", reload_magnet_validation);
 
     // === PARTICLE CLOUD SUBSCRIPTIONS ===
     register_cloud_subscriptions();
@@ -5567,10 +5625,30 @@ void stress_test_loop()
     }
 }
 
+static int mag_test_counter = 0;
+
 void magnet_validation_loop()
 {
     if (validate_magnets())
     {
+        // Load latest file into buffer
+        load_latest_magnet_validation(false);
+
+        // Prepend #counter\ttimestamp line for BIMS change detection
+        mag_test_counter++;
+        char header[32];
+        snprintf(header, sizeof(header), "#%03d\t%lu\r\n", mag_test_counter, (unsigned long)Time.now());
+        int header_len = strlen(header);
+        int data_len = strlen(magnet_validation_data);
+        if (header_len + data_len < MAGNETOMETER_BUFFER_SIZE)
+        {
+            memmove(magnet_validation_data + header_len, magnet_validation_data, data_len + 1);
+            memcpy(magnet_validation_data, header, header_len);
+        }
+
+        // Auto-clean old validation files (keep last 10)
+        cleanup_old_validation_files(10);
+
         device_state.transition_to(DeviceMode::IDLE);
     }
 }
