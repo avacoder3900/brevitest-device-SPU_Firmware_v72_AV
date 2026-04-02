@@ -15,7 +15,14 @@
       "WebFetch(domain:community.particle.io)",
       "WebFetch(domain:docs.staging.particle.io)",
       "WebFetch(domain:changelog.particle.io)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "WebFetch(domain:)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(npm install:*)",
+      "WebFetch(domain:particle.io)"
     ]
   }
 }

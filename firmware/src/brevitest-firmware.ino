@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(68);
+PRODUCT_VERSION(79);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -195,6 +195,176 @@ int set_wifi_credentials(String params)
     }
 }
 
+/////////////////////////////////////////////////////////////
+//                                                         //
+//                  LOGGING & CHECKPOINTS                  //
+//                                                         //
+/////////////////////////////////////////////////////////////
+
+void checkpoint(uint8_t code) {
+    eeprom.cp_buffer[eeprom.cp_index] = code;
+    eeprom.cp_index = (eeprom.cp_index + 1) % CP_BUFFER_SIZE;
+    EEPROM.put(0, eeprom);
+    Log.info(">>> CP %d", code);
+}
+
+void device_log(const char* fmt, ...) {
+    char message[LOG_LINE_LENGTH];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, LOG_LINE_LENGTH, fmt, args);
+    va_end(args);
+
+    // Layer 1: Serial output (real-time)
+    Log.info("%s", message);
+
+    // Layer 2: RAM buffer (for file flush)
+    unsigned long ms = millis();
+    snprintf(log_buffer.lines[log_buffer.index], LOG_LINE_LENGTH,
+             "%lu|%s", ms, message);
+    log_buffer.index = (log_buffer.index + 1) % LOG_BUFFER_LINES;
+    log_buffer.count++;
+}
+
+void rotate_log_file() {
+    unlink("/log/session.old.txt");
+    rename("/log/session.txt", "/log/session.old.txt");
+    Log.info("Log file rotated to session.old.txt");
+}
+
+void clear_all_logs() {
+    // Clear flash logs
+    unlink("/log/session.txt");
+    unlink("/log/session.old.txt");
+    // Clear EEPROM checkpoint buffer
+    memset(eeprom.cp_buffer, 0, CP_BUFFER_SIZE);
+    eeprom.cp_index = 0;
+    EEPROM.put(0, eeprom);
+    // Clear RAM buffer
+    memset(log_buffer.lines, 0, sizeof(log_buffer.lines));
+    log_buffer.index = 0;
+    log_buffer.count = 0;
+    Serial.println("All logs cleared (flash, EEPROM, RAM)");
+}
+
+void write_session_header() {
+    device_log("======== SESSION START ========");
+    device_log("Boot #%d | Device: %s", eeprom.cp_boot_count, device_id.c_str());
+    device_log("Firmware: v%d | Format: v%d", FIRMWARE_VERSION, DATA_FORMAT_VERSION);
+    if (Time.isValid()) {
+        device_log("Time: %s", Time.format(TIME_FORMAT_ISO8601_FULL).c_str());
+    } else {
+        device_log("Time: not synced");
+    }
+    device_log("===============================");
+}
+
+void flush_log_to_file() {
+    if (log_buffer.count == 0) return;
+
+    // Rotate if current file exceeds half the cap (keeps two files within total cap)
+    struct stat st;
+    if (stat("/log/session.txt", &st) == 0 && st.st_size >= LOG_FILE_MAX_SIZE / 2) {
+        rotate_log_file();
+    }
+
+    int fd = open("/log/session.txt", O_WRONLY | O_CREAT | O_APPEND);
+    if (fd < 0) {
+        Log.error("flush_log_to_file: failed to open, errno: %d", errno);
+        return;
+    }
+
+    int start = log_buffer.count >= LOG_BUFFER_LINES
+                ? log_buffer.index
+                : 0;
+    int lines_to_write = log_buffer.count >= LOG_BUFFER_LINES
+                         ? LOG_BUFFER_LINES
+                         : log_buffer.count;
+
+    for (int i = 0; i < lines_to_write; i++) {
+        int idx = (start + i) % LOG_BUFFER_LINES;
+        if (log_buffer.lines[idx][0] != '\0') {
+            write(fd, log_buffer.lines[idx], strlen(log_buffer.lines[idx]));
+            write(fd, "\n", 1);
+        }
+    }
+
+    close(fd);
+
+    memset(log_buffer.lines, 0, sizeof(log_buffer.lines));
+    log_buffer.index = 0;
+    log_buffer.count = 0;
+}
+
+void dump_checkpoint_trail() {
+    uint8_t last_index = (eeprom.cp_index - 1 + CP_BUFFER_SIZE) % CP_BUFFER_SIZE;
+    uint8_t last_checkpoint = eeprom.cp_buffer[last_index];
+    bool was_interrupted = (last_checkpoint % 2 == 0) && (last_checkpoint != 0);
+
+    device_log("=== PREV SESSION CHECKPOINTS (boot #%d) ===", eeprom.cp_boot_count);
+    if (was_interrupted) {
+        device_log("!!! INTERRUPTED at checkpoint %d", last_checkpoint);
+    }
+
+    for (int i = 0; i < CP_BUFFER_SIZE; i++) {
+        int idx = (eeprom.cp_index + i) % CP_BUFFER_SIZE;
+        if (eeprom.cp_buffer[idx] != 0) {
+            device_log("  CP[%d] = %d", i, eeprom.cp_buffer[idx]);
+        }
+    }
+    device_log("=== END CHECKPOINTS ===");
+
+    // Clear buffer for new session
+    eeprom.cp_boot_count++;
+    memset(eeprom.cp_buffer, 0, CP_BUFFER_SIZE);
+    eeprom.cp_index = 0;
+    EEPROM.put(0, eeprom);
+}
+
+void dump_checkpoint_buffer_to_serial() {
+    Serial.println("\n=== EEPROM CHECKPOINT BUFFER (current session) ===");
+    Serial.printlnf("Boot count: %d, Current index: %d", eeprom.cp_boot_count, eeprom.cp_index);
+    for (int i = 0; i < CP_BUFFER_SIZE; i++) {
+        if (eeprom.cp_buffer[i] != 0) {
+            Serial.printlnf("  CP[%d] = %d", i, eeprom.cp_buffer[i]);
+        }
+    }
+    Serial.println("=== END CHECKPOINT BUFFER ===\n");
+}
+
+void dump_one_log_file(const char* filepath) {
+    struct stat st;
+    if (stat(filepath, &st) != 0) return;
+    Serial.printlnf("\n--- %s (%ld bytes) ---", filepath, st.st_size);
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        Serial.printlnf("Failed to open %s, errno: %d", filepath, errno);
+        return;
+    }
+    char buf[128];
+    int bytes_read;
+    while ((bytes_read = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[bytes_read] = '\0';
+        Serial.print(buf);
+    }
+    close(fd);
+}
+
+void dump_flash_log_to_serial() {
+    struct stat st_old, st_cur;
+    bool has_old = (stat("/log/session.old.txt", &st_old) == 0);
+    bool has_cur = (stat("/log/session.txt", &st_cur) == 0);
+    if (!has_old && !has_cur) {
+        Serial.println("No log files found");
+        return;
+    }
+    long total = (has_old ? st_old.st_size : 0) + (has_cur ? st_cur.st_size : 0);
+    Serial.printlnf("\n=== FLASH LOG (%ld bytes total) ===", total);
+    if (has_old) dump_one_log_file("/log/session.old.txt");
+    if (has_cur) dump_one_log_file("/log/session.txt");
+    Serial.println("\n=== END FLASH LOG ===\n");
+}
+
 ////////////////////////////////////////////////////////////
 //                                                         //
 //                         EEPROM                          //
@@ -287,16 +457,18 @@ void write_test_to_file()
 {
     struct stat statbuf;
     String filename = "/cache/" + String(test.cartridge_id);
+    checkpoint(CP_FILE_WRITE_TEST);
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0)
     {
-        Log.error("write_test_to_file: failed to open %s, errno: %d", filename.c_str(), errno);
+        device_log("write_test_to_file: failed to open %s, errno: %d", filename.c_str(), errno);
         return;
     }
     int written = write(fd, (char *)&test, sizeof(test));
     close(fd);
+    checkpoint(CP_FILE_WRITE_TEST_OK);
     stat(filename, &statbuf);
-    Log.info("write_test_to_file, test size: %d, bytes written: %d, file size: %ld", sizeof test, written, statbuf.st_size);
+    device_log("write_test_to_file, test size: %d, bytes written: %d, file size: %ld", sizeof test, written, statbuf.st_size);
 }
 
 void clear_cache()
@@ -321,19 +493,19 @@ void load_cached_test(char *filename)
     struct stat statbuf;
     if (filename == NULL)
     {
-        Log.error("load_cached_test: filename is NULL");
+        device_log("load_cached_test: filename is NULL");
         return;
     }
     int fd = open(filename, O_RDONLY);
     if (fd < 0)
     {
-        Log.error("load_cached_test: failed to open %s, errno: %d", filename, errno);
+        device_log("load_cached_test: failed to open %s, errno: %d", filename, errno);
         return;
     }
     int bytes_read = read(fd, (char *)&test, sizeof(test));
     close(fd);
     stat(filename, &statbuf);
-    Log.info("load_cached_test from %s, test size: %d, bytes read: %d, file size: %ld", filename, (int)sizeof(test), bytes_read, statbuf.st_size);
+    device_log("load_cached_test from %s, test size: %d, bytes read: %d, file size: %ld", filename, (int)sizeof(test), bytes_read, statbuf.st_size);
     Log.info("Test loaded, cartridge: %s, assay: %s, readings: %d", test.cartridge_id, test.assay_id, test.number_of_readings);
 }
 
@@ -342,7 +514,7 @@ bool test_in_cache()
     DIR *cache = opendir("/cache");
     if (cache == NULL)
     {
-        Log.error("test_in_cache: Failed to open /cache directory, errno: %d", errno);
+        device_log("test_in_cache: Failed to open /cache directory, errno: %d", errno);
         return false;
     }
     
@@ -409,25 +581,33 @@ bool save_assay_to_file()
 
     if (assay.id[0] == '\0')
     {
-        Log.error("save_assay_to_file, assay.id is empty");
+        device_log("save_assay_to_file, assay.id is empty");
         return false;
     }
 
     String filename = "/assay/" + String(assay.id);
+    checkpoint(CP_FILE_WRITE_ASSAY);
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND);
     if (fd < 0)
     {
-        Log.error("save_assay_to_file, failed to open file %s, errno: %d", filename.c_str(), errno);
+        device_log("save_assay_to_file, failed to open file %s, errno: %d", filename.c_str(), errno);
         return false;
     }
     String assay_data = String(assay.id) + "\n" +
                         String(assay.duration) + "\n" +
                         String(assay.BCODE) + "\n";
-    write(fd, assay_data.c_str(), assay_data.length());
+    ssize_t written = write(fd, assay_data.c_str(), assay_data.length());
     close(fd);
 
+    if (written != (ssize_t)assay_data.length())
+    {
+        device_log("save_assay_to_file FAILED: wrote %d of %d bytes to %s", (int)written, assay_data.length(), filename.c_str());
+        return false;
+    }
+
+    checkpoint(CP_FILE_WRITE_ASSAY_OK);
     stat(filename, &statbuf);
-    Log.info("save_assay_to_file, assay data size: %d, file size: %ld", assay_data.length(), statbuf.st_size);
+    device_log("save_assay_to_file, assay data size: %d, file size: %ld", assay_data.length(), statbuf.st_size);
     return true;
 }
 
@@ -440,21 +620,23 @@ bool load_assay_from_file(String assay_id, int BCODE_checksum = 0)
 
     if (assay_id.length() == 0)
     {
-        Log.error("load_assay_from_file, assay.id is empty");
+        device_log("load_assay_from_file, assay.id is empty");
         return false;
     }
 
     String filename = "/assay/" + assay_id;
-    
+
+    checkpoint(CP_FILE_READ_ASSAY);
     int fd = open(filename, O_RDONLY);
     if (fd < 0)
     {
-        Log.error("load_assay_from_file, failed to open file %s, errno: %d", filename.c_str(), errno);
+        device_log("load_assay_from_file, failed to open file %s, errno: %d", filename.c_str(), errno);
         return false;
     }
 
     bytes_read = read(fd, assay_buffer, sizeof assay_buffer - 1);
     close(fd);
+    checkpoint(CP_FILE_READ_ASSAY_OK);
 
     assay_buffer[bytes_read] = '\0'; // null-terminate the string
 
@@ -462,7 +644,7 @@ bool load_assay_from_file(String assay_id, int BCODE_checksum = 0)
     if (strncmp(assay_id, assay_buffer, index) != 0)
     {
         assay_buffer[index] = '\0'; // null-terminate the assay id
-        Log.error("load_assay_from_file, assay id doesn't match file data - assay id: %s, filename: %s", assay_id.c_str(), assay_buffer);
+        device_log("load_assay_from_file, assay id doesn't match file data - assay id: %s, filename: %s", assay_id.c_str(), assay_buffer);
         assay.id[0] = '\0'; // reset assay id
         return false;
     }
@@ -481,7 +663,7 @@ bool load_assay_from_file(String assay_id, int BCODE_checksum = 0)
     
     if (BCODE_checksum != 0 && checksum_value != BCODE_checksum)
     {
-        Log.error("load_assay_from_file, BCODE checksum mismatch - expected: %d, actual: %d", BCODE_checksum, checksum_value);
+        device_log("load_assay_from_file, BCODE checksum mismatch - expected: %d, actual: %d", BCODE_checksum, checksum_value);
         assay.id[0] = '\0'; // reset assay id
         return false;
     }
@@ -648,226 +830,6 @@ void testFCCCompliance()
     Serial.println("✓ WiFi, Cellular, and Bluetooth ON");
 }
 
-// ─── FCC WORST-CASE EMISSION TEST ───────────────────────────
-// Runs all noisy peripherals simultaneously to find peak
-// unintentional radiated/conducted emissions for FCC Part 15
-// Subpart B testing (ANSI C63.4-2014).
-//
-// Command 8504: Start worst-case emission mode
-// Command 8505: Stop worst-case emission mode
-//
-// What it activates:
-//   • Stepper motor oscillating continuously (highest noise source)
-//   • Heater at max PWM duty cycle
-//   • All 3 LEDs/lasers ON at full power
-//   • Buzzer pulsing at test frequency
-//   • Spectrophotometer I2C bus active (reading continuously)
-//   • All radios ON (WiFi + Cellular + BLE)
-//
-// ⚠️  DO NOT insert a cartridge during this test.
-//     Heater runs at max power with no thermal feedback.
-//     Motor oscillates without limit switch protection.
-//     Run only under supervised lab conditions.
-// ────────────────────────────────────────────────────────────
-
-bool fcc_worst_case_running = false;
-unsigned long fcc_motor_last_step = 0;
-unsigned long fcc_buzzer_last_toggle = 0;
-unsigned long fcc_heater_last_check = 0;
-bool fcc_buzzer_on = false;
-bool fcc_heater_active = false;
-int fcc_motor_direction = LOW;
-unsigned long fcc_motor_steps = 0;
-
-#define FCC_HEATER_MAX_TEMP 500        // 50.0°C in 10ths of a degree
-#define FCC_HEATER_RESUME_TEMP 450     // 45.0°C — resume heating (hysteresis)
-#define FCC_HEATER_CHECK_INTERVAL 500  // check temp every 500ms
-
-void startFCCWorstCase()
-{
-    Serial.println("\n╔════════════════════════════════════════════════════╗");
-    Serial.println("║   FCC WORST-CASE UNINTENTIONAL RADIATOR TEST      ║");
-    Serial.println("║   All peripherals active for max emission          ║");
-    Serial.println("╠════════════════════════════════════════════════════╣");
-    Serial.println("║  ⚠️  DO NOT INSERT CARTRIDGE                       ║");
-    Serial.println("║  ⚠️  SUPERVISED LAB USE ONLY                       ║");
-    Serial.println("║  ⚠️  Send 8505 to stop                             ║");
-    Serial.println("╚════════════════════════════════════════════════════╝");
-
-    // 1. Enable all radios
-    enableAllRadios();
-    Serial.println("  ✓ All radios ON (WiFi + Cellular + BLE)");
-
-    // 2. Wake motor, home it, then start oscillating
-    wake_motor();
-    Serial.println("  ⏳ Homing motor to proximal limit...");
-    move_stage_until_proximal_limit(MOTOR_RESET_STEP_DELAY);
-    Serial.println("  ✓ Motor homed — starting oscillation");
-    fcc_motor_direction = LOW; // start moving distal
-    digitalWrite(pinMotorDir, fcc_motor_direction);
-    fcc_motor_last_step = micros();
-
-    // 3. Heater at max power WITH thermal cutoff at 50°C
-    analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
-    fcc_heater_active = true;
-    fcc_heater_last_check = millis();
-    Serial.println("  ✓ Heater at MAX power (capped at 50°C)");
-
-    // 4. All LEDs/lasers ON at full power
-    analogWrite(pinLaserA, 255);
-    analogWrite(pinLaserB, 255);
-    analogWrite(pinLaserC, 255);
-    Serial.println("  ✓ All 3 LEDs/Lasers at full power");
-
-    // 5. Spectrophotometer switch active (cycle through channels)
-    init_spectrophotometer_switch();
-    Wire.beginTransmission(SPECTRO_SWITCH_ADDR);
-    Wire.write(SPECTRO_SWITCH_OUTPUT_COMMAND);
-    Wire.write(SPECTRO_SWITCH_TURN_ON_A | SPECTRO_SWITCH_TURN_ON_B | SPECTRO_SWITCH_TURN_ON_C);
-    Wire.endTransmission();
-    Serial.println("  ✓ Spectrophotometer I2C active (all channels)");
-
-    // 6. Buzzer pulsing
-    tone(pinBuzzer, BUZZER_FREQUENCY, 0); // continuous tone
-    fcc_buzzer_on = true;
-    fcc_buzzer_last_toggle = millis();
-    Serial.println("  ✓ Buzzer pulsing at 600 Hz");
-
-    fcc_worst_case_running = true;
-
-    Serial.println("\n  ▶ WORST-CASE EMISSION MODE ACTIVE");
-    Serial.println("    All peripherals running simultaneously.");
-    Serial.println("    Test lab can now measure peak emissions.");
-    Serial.println("    Send command 8505 to stop.\n");
-}
-
-void stopFCCWorstCase()
-{
-    fcc_worst_case_running = false;
-
-    // Stop motor
-    sleep_motor();
-
-    // Stop heater
-    analogWrite(pinHeater, 0);
-    fcc_heater_active = false;
-
-    // Stop LEDs
-    analogWrite(pinLaserA, 0);
-    analogWrite(pinLaserB, 0);
-    analogWrite(pinLaserC, 0);
-
-    // Stop buzzer
-    noTone(pinBuzzer);
-    fcc_buzzer_on = false;
-
-    // Turn off spectrophotometer switches
-    Wire.beginTransmission(SPECTRO_SWITCH_ADDR);
-    Wire.write(SPECTRO_SWITCH_OUTPUT_COMMAND);
-    Wire.write(SPECTRO_SWITCH_TURN_OFF_ALL);
-    Wire.endTransmission();
-
-    // Disable radios
-    disableAllRadios();
-
-    Serial.println("\n╔════════════════════════════════════════════════════╗");
-    Serial.println("║   WORST-CASE EMISSION TEST STOPPED                ║");
-    Serial.println("║   All peripherals deactivated                     ║");
-    Serial.println("╚════════════════════════════════════════════════════╝");
-}
-
-// Call this from loop() to keep motor oscillating and buzzer pulsing
-void updateFCCWorstCase()
-{
-    if (!fcc_worst_case_running)
-        return;
-
-    // Oscillate motor: continuously back and forth on the linear rail
-    // Uses limit switch (proximal) and STAGE_POSITION_LIMIT (distal)
-    // Direction HIGH = toward limit switch (proximal/home)
-    // Direction LOW  = away from limit switch (distal)
-    unsigned long now_us = micros();
-    if (now_us - fcc_motor_last_step >= (unsigned long)MOTOR_MINIMUM_STEP_DELAY)
-    {
-        fcc_motor_last_step = now_us;
-
-        // Check if we hit the proximal limit switch
-        if (fcc_motor_direction == HIGH && digitalRead(pinStageLimit) == LOW)
-        {
-            // Hit home — reverse to go distal
-            fcc_motor_direction = LOW;
-            digitalWrite(pinMotorDir, fcc_motor_direction);
-            stage_position = 0;
-            Serial.println("  ↔ Motor reversed (hit proximal limit)");
-            return; // skip this step, let direction settle
-        }
-
-        // Check if we hit half the rail (22.5mm)
-        if (fcc_motor_direction == LOW && stage_position >= (STAGE_POSITION_LIMIT / 2))
-        {
-            // Hit far end — reverse to go proximal
-            fcc_motor_direction = HIGH;
-            digitalWrite(pinMotorDir, fcc_motor_direction);
-            Serial.println("  ↔ Motor reversed (hit distal limit)");
-            return;
-        }
-
-        // Take a step
-        digitalWrite(pinMotorStep, HIGH);
-        delayMicroseconds(2);
-        digitalWrite(pinMotorStep, LOW);
-
-        // Track position
-        if (fcc_motor_direction == HIGH)
-            stage_position -= MOTOR_MICRONS_PER_EIGHTH_STEP;
-        else
-            stage_position += MOTOR_MICRONS_PER_EIGHTH_STEP;
-
-        if (stage_position < 0)
-            stage_position = 0;
-    }
-
-    // Thermal management: cap heater at 50°C with hysteresis
-    unsigned long now_ms = millis();
-    if (now_ms - fcc_heater_last_check >= FCC_HEATER_CHECK_INTERVAL)
-    {
-        fcc_heater_last_check = now_ms;
-        int raw = analogRead(pinHeaterThermistor);
-        int temp = raw_table_lookup(raw);  // returns 10ths of °C
-
-        if (fcc_heater_active && temp >= FCC_HEATER_MAX_TEMP)
-        {
-            analogWrite(pinHeater, 0);
-            fcc_heater_active = false;
-            Serial.printf("  ⚡ Heater OFF — reached %.1f°C (limit 50°C)\n", temp / 10.0);
-        }
-        else if (!fcc_heater_active && temp <= FCC_HEATER_RESUME_TEMP)
-        {
-            analogWrite(pinHeater, HEATER_MAX_POWER, HEATER_PWM_FREQUENCY);
-            fcc_heater_active = true;
-            Serial.printf("  🔥 Heater ON — cooled to %.1f°C (resuming)\n", temp / 10.0);
-        }
-    }
-
-    // Pulse buzzer: 500ms on, 500ms off
-    if (now_ms - fcc_buzzer_last_toggle >= 500)
-    {
-        fcc_buzzer_last_toggle = now_ms;
-        if (fcc_buzzer_on)
-        {
-            noTone(pinBuzzer);
-            fcc_buzzer_on = false;
-        }
-        else
-        {
-            tone(pinBuzzer, BUZZER_FREQUENCY, 0);
-            fcc_buzzer_on = true;
-        }
-    }
-}
-
-// ─── END FCC WORST-CASE TEST ────────────────────────────────
-
 void emissionCheck()
 {
     Serial.println("\n╔════════════════════════════════╗");
@@ -936,8 +898,6 @@ void displayHelp()
     Serial.println("║   8501 - Test Cellular only           ║");
     Serial.println("║   8502 - Test Bluetooth only          ║");
     Serial.println("║   8503 - FCC compliance (all radios)  ║");
-    Serial.println("║   8504 - WORST-CASE emission test     ║");
-    Serial.println("║   8505 - Stop worst-case test         ║");
     Serial.println("║                                       ║");
     Serial.println("║ MASTER CONTROL:                       ║");
     Serial.println("║   8900 - ALL radios OFF               ║");
@@ -1140,6 +1100,108 @@ void oscillate_stage(int amplitude, int step_delay, int cycles, bool inBCODE)
         if (inBCODE)
             BCODE_loop();
         move_stage(-amplitude, step_delay);
+        if (inBCODE)
+            BCODE_loop();
+        if (device_state.test_state == TestState::CANCELLED)
+            return;
+    }
+}
+
+/**
+ * @brief Move stage with sinusoidal velocity profile (one half-stroke)
+ *
+ * Velocity vs position follows: v(x) = v_max * sin(pi * x / D) ^ shape
+ * v_max is determined by peak_delay_us (step delay at the midpoint).
+ * The period is derived — not an input.
+ *
+ * @param microns Distance to move (positive = distal, negative = proximal)
+ * @param peak_delay_us Step delay at peak velocity in microseconds
+ * @param shape_pct Shape as percentage (100 = pure sine, >100 = narrower, <100 = wider)
+ */
+void move_stage_sinusoidal(int microns, int peak_delay_us, int shape_pct)
+{
+    int abs_microns, N, dir;
+
+    if (!motor_awake)
+    {
+        wake_motor();
+    }
+
+    dir = (microns < 0) ? HIGH : LOW;
+    digitalWrite(pinMotorDir, dir);
+
+    abs_microns = abs(microns) + microns_error;
+    N = abs_microns / MOTOR_MICRONS_PER_EIGHTH_STEP;
+    microns_error = abs_microns % MOTOR_MICRONS_PER_EIGHTH_STEP;
+
+    if (N == 0)
+    {
+        Log.warn("move_stage_sinusoidal: zero steps (microns=%d)", microns);
+        return;
+    }
+    if (N > SINUSOIDAL_MAX_STEPS)
+    {
+        Log.warn("move_stage_sinusoidal: %d steps exceeds max %d", N, SINUSOIDAL_MAX_STEPS);
+        return;
+    }
+
+    // Precompute phase delays for sinusoidal velocity profile
+    // v(x) = v_max * sin(pi * x / D) ^ shape
+    // v_max = step_size / (2 * peak_delay_us)
+    // phase_delay_i = peak_delay_us / sin(pi * (i+0.5) / N) ^ shape
+    static int delays[SINUSOIDAL_MAX_STEPS];
+    float shape = shape_pct / 100.0f;
+    int clamped_count = 0;
+
+    for (int i = 0; i < N; i++)
+    {
+        float midpoint = ((float)i + 0.5f) / (float)N;
+        float sin_val = powf(sinf((float)M_PI * midpoint), shape);
+        int phase_delay = (int)((float)peak_delay_us / sin_val);
+        if (phase_delay < MOTOR_MINIMUM_STEP_DELAY)
+        {
+            phase_delay = MOTOR_MINIMUM_STEP_DELAY;
+            clamped_count++;
+        }
+        delays[i] = phase_delay;
+    }
+
+    if (clamped_count > 0)
+    {
+        Log.warn("Sinusoidal move: %d/%d steps clamped to min delay %d us", clamped_count, N, MOTOR_MINIMUM_STEP_DELAY);
+    }
+
+    // Execute steps with precomputed sinusoidal delays
+    for (int i = 0; i < N; i++)
+    {
+        if (!move_one_eighth_step(dir, delays[i]))
+        {
+            break;
+        }
+    }
+}
+
+/**
+ * @brief Oscillate stage with sinusoidal velocity profile
+ *
+ * Full back-and-forth oscillation with smooth sinusoidal motion.
+ * Velocity follows v(x) = v_max * sin(pi * x / D) ^ shape.
+ * Period is derived from peak_delay and shape.
+ *
+ * @param amplitude Distance of one half-stroke in microns
+ * @param peak_delay_us Step delay at peak velocity in microseconds
+ * @param shape_pct Shape as percentage (100 = pure sine, >100 = narrower, <100 = wider)
+ * @param cycles Number of full oscillation cycles
+ * @param inBCODE If true, calls BCODE_loop() at each reversal for heater PID and cartridge detection
+ */
+void oscillate_stage_sinusoidal(int amplitude, int peak_delay_us, int shape_pct, int cycles, bool inBCODE)
+{
+    for (int i = 0; i < cycles; i++)
+    {
+        move_stage_sinusoidal(amplitude, peak_delay_us, shape_pct);
+        if (inBCODE)
+            BCODE_loop();
+        move_stage_sinusoidal(-amplitude, peak_delay_us, shape_pct);
         if (inBCODE)
             BCODE_loop();
         if (device_state.test_state == TestState::CANCELLED)
@@ -1363,7 +1425,7 @@ void turn_on_heater(int power)
     power = limit(power, HEATER_MAX_POWER, 0);
     if (heater.temp_C_10X > HEATER_MAX_TEMPERATURE)
     {
-        Log.info("Heater is too hot, turning off");
+        device_log("Heater is too hot, turning off");
         turn_off_heater();
         return;
     }
@@ -1474,12 +1536,9 @@ int load_latest_magnet_validation(bool serial_output = true)
             Log.error("Failed to open latest validation file: %s, errno: %d", magnet_validation_filename.c_str(), errno);
             return -1;
         }
-        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE - 1);
+        bytes_read = read(fd, magnet_validation_data, MAGNETOMETER_BUFFER_SIZE);
         close(fd);
-        if (bytes_read > 0) {
-            magnet_validation_data[bytes_read] = '\0';
-        }
-        Log.info("Latest validation file: %s, bytes: %d", magnet_validation_filename.c_str(), bytes_read);
+        device_log("Latest validation file: %s, bytes: %d", magnet_validation_filename.c_str(), bytes_read);
         if (serial_output)
         {
             Serial.println(magnet_validation_data);
@@ -1487,7 +1546,7 @@ int load_latest_magnet_validation(bool serial_output = true)
     }
     else
     {
-        Log.info("No validation files found");
+        device_log("No validation files found");
     }
     return bytes_read;
 }
@@ -1562,11 +1621,8 @@ void close_magnet_validation_file(int fd)
 
     close(fd);
     stat(magnet_validation_filename, &statbuf);
-    Log.info("write_magnet_validation_to_file, test size: %d, event data size: %d, file size: %ld", sizeof test, event.data().size(), statbuf.st_size);
+    device_log("write_magnet_validation_to_file, test size: %d, event data size: %d, file size: %ld", sizeof test, event.data().size(), statbuf.st_size);
 }
-
-int mag_buf_offset = 0;
-int mag_test_counter = 0;
 
 void check_magnets_in_one_well(int well, int fd)
 {
@@ -1585,9 +1641,6 @@ void check_magnets_in_one_well(int well, int fd)
     out_str = String::format("%d\t%s\r\n", (well + 1), result.c_str());
     Serial.print(out_str.c_str());
     write(fd, out_str.c_str(), out_str.length());
-    // Also accumulate directly into Particle variable buffer
-    mag_buf_offset += snprintf(magnet_validation_data + mag_buf_offset,
-        MAGNETOMETER_BUFFER_SIZE - mag_buf_offset, "%d\t%s\r\n", (well + 1), result.c_str());
 }
 
 int validate_magnets()
@@ -1608,7 +1661,7 @@ int validate_magnets()
             }
             if (magnetometer.connected())
             {
-                Log.info("Connected to magnetometer");
+                device_log("Connected to magnetometer");
                 reset_stage(false);
                 move_stage_to_magnetometer_start_position();
                 int fd = create_magnet_validation_file();
@@ -1616,12 +1669,6 @@ int validate_magnets()
                 write(fd, magnet_title_2.c_str(), magnet_title_2.length());
                 Serial.print(magnet_title_1.c_str());
                 Serial.print(magnet_title_2.c_str());
-                // Seed Particle variable buffer with test counter + headers
-                mag_test_counter++;
-                memset(magnet_validation_data, 0, MAGNETOMETER_BUFFER_SIZE);
-                mag_buf_offset = snprintf(magnet_validation_data, MAGNETOMETER_BUFFER_SIZE,
-                    "#%03d\t%lu\r\n%s%s", mag_test_counter, (unsigned long)Time.now(),
-                    magnet_title_1.c_str(), magnet_title_2.c_str());
                 for (int i = 0; i < MAGNETOMETER_NUMBER_OF_WELLS; i++)
                 {
                     check_magnets_in_one_well(i, fd);
@@ -1633,19 +1680,19 @@ int validate_magnets()
             }
             else
             {
-                Log.info("Could not connect to magnetometer %s", barcode_uuid);
+                device_log("Could not connect to magnetometer %s", barcode_uuid);
                 return 0;
             }
         }
         else
         {
-            Log.info("Magnetometer not found");
+            device_log("Magnetometer not found");
             return 0;
         }
     }
     else
     {
-        Log.info("Magnetometer check cancelled");
+        device_log("Magnetometer check cancelled");
         device_state.transition_to(DeviceMode::IDLE);
         return 0;
     }
@@ -2135,7 +2182,7 @@ int get_heater_temperature()
     {
         if (heater_reads[i] == 0)
         {
-            Log.info("Thermistor read error");
+            device_log("Thermistor read error");
             stop_temperature_control();
             heater.temp_C_10X = 0;
             current_temperature = 0;
@@ -2154,7 +2201,8 @@ int get_heater_temperature()
     heater.temp_F_10X = ((heater.temp_C_10X * 9) / 5) + 320;
     if (heater.temp_C_10X > HEATER_MAX_TEMPERATURE)
     {
-        Log.info("Heater temperature too high: %d.%d˚C", heater.temp_C_10X / 10, heater.temp_C_10X % 10);
+        device_log("Heater temperature too high: %d.%d˚C", heater.temp_C_10X / 10, heater.temp_C_10X % 10);
+        checkpoint(CP_HEATER_OVERHEAT);
         stop_temperature_control();
         raw = 0;
     }
@@ -2188,8 +2236,26 @@ int pid_controller()
             {
                 dt = heater.read_time - prev_read_time;
                 error = heater.target_C_10X - heater.temp_C_10X;
-                heater.integral += (error * dt) / 1000;
+
+                // Compute raw output from P + I + D
                 derivative = (1000 * (error - heater.previous_error)) / dt;
+                output = (heater.k_p_num * error) / heater.k_p_den;
+                output += (heater.k_i_num * heater.integral) / heater.k_i_den;
+                output += (heater.k_d_num * derivative) / heater.k_d_den;
+
+                // Conditional integration: only accumulate integral when output is
+                // within actuator range. Prevents windup during heating ramp when
+                // output is saturated at 255, while allowing a higher Ki for
+                // faster steady-state error correction.
+                if (output > 0 && output < HEATER_MAX_POWER) {
+                    heater.integral += (error * dt) / 1000;
+                }
+
+                // Anti-windup: clamp integral so its contribution can't exceed output range
+                int max_integral = (HEATER_MAX_POWER * heater.k_i_den) / heater.k_i_num;
+                heater.integral = limit(heater.integral, max_integral, -max_integral);
+
+                // Recompute output with updated integral
                 output = (heater.k_p_num * error) / heater.k_p_den;
                 output += (heater.k_i_num * heater.integral) / heater.k_i_den;
                 output += (heater.k_d_num * derivative) / heater.k_d_den;
@@ -2212,14 +2278,14 @@ void start_temperature_control()
 {
     heater.read_time = 0;
     temperature_control_on = true;
-    Log.info("Temperature control system started");
+    device_log("Temperature control system started");
 }
 
 void stop_temperature_control()
 {
     temperature_control_on = false;
     set_heater_power(0);
-    Log.info("Temperature control system stopped");
+    device_log("Temperature control system stopped");
 }
 
 /////////////////////////////////////////////////////////////
@@ -2229,30 +2295,198 @@ void stop_temperature_control()
 /////////////////////////////////////////////////////////////
 
 /////////////////////////////////////////////////////
+//            DEVICE LOG UPLOAD (Build 1C)         //
+/////////////////////////////////////////////////////
+
+// Track whether a log upload is in progress (waiting for response)
+bool log_upload_pending = false;
+unsigned long log_upload_started = 0;
+#define LOG_UPLOAD_TIMEOUT_MS 30000
+
+// Deferred log upload: cloud function sets this flag, main loop publishes
+bool deferred_log_upload = false;
+
+/**
+ * @brief Handle device-log webhook response from cloud
+ *
+ * Called when the middleware confirms it received (or failed to receive)
+ * the session log. On SUCCESS, delete the log file from flash.
+ * On FAILURE, leave the file for retry next idle cycle.
+ */
+void response_device_log(const char *event_name, const char *data)
+{
+    log_upload_pending = false;
+
+    if (data == NULL) {
+        Log.info("device-log response: no data");
+        return;
+    }
+
+    Variant json = Variant::fromJSON(String(data));
+    String status = json.get("status").toString();
+
+    if (status == "SUCCESS") {
+        // Middleware received the log — safe to delete from flash
+        unlink("/log/session.old.txt");
+        Log.info("Session log uploaded and deleted from flash");
+    } else {
+        // Upload failed — keep the file, will retry next cycle
+        String errorMessage = json.get("errorMessage").toString();
+        Log.info("Session log upload failed: %s", errorMessage.length() > 0 ? errorMessage.c_str() : "unknown error");
+    }
+
+    flush_log_to_file();
+}
+
+/**
+ * @brief Attempt to upload the session log file to the cloud
+ *
+ * Called from the idle loop. Uploads /log/session.old.txt via the same
+ * CloudEvent + loadData() binary pattern used by upload-test.
+ *
+ * Flow:
+ *   1. Flush current RAM buffer to session.txt
+ *   2. Rotate session.txt → session.old.txt (so new logs go to a fresh file)
+ *   3. Upload session.old.txt as "device-log" event
+ *   4. On SUCCESS response (in response_device_log): delete session.old.txt
+ *   5. On FAILURE or timeout: leave file, retry next cycle
+ */
+void try_upload_session_log()
+{
+    // Don't attempt if already waiting for a response
+    if (log_upload_pending) {
+        if (millis() - log_upload_started > LOG_UPLOAD_TIMEOUT_MS) {
+            Log.info("Session log upload timed out");
+            log_upload_pending = false;
+        }
+        return;
+    }
+
+    // Don't attempt if cloud event is busy or rate limited
+    if (event.isSending() || ((lastPublish != 0) && (millis() - lastPublish < publishPeriod.count()))) {
+        return;
+    }
+
+    // Don't attempt if not connected
+    if (!Particle.connected()) {
+        return;
+    }
+
+    // Check if there's a log file to upload
+    // First flush current buffer, then rotate so we upload a stable file
+    flush_log_to_file();
+
+    struct stat st;
+    if (stat("/log/session.txt", &st) != 0 || st.st_size == 0) {
+        return; // No log file or empty
+    }
+
+    // Rotate: session.txt → session.old.txt
+    // This way new device_log() calls during upload go to a fresh session.txt
+    unlink("/log/session.old.txt");
+    rename("/log/session.txt", "/log/session.old.txt");
+
+    // Prepend a metadata header to the upload file so the middleware can
+    // extract firmware version, boot count, etc. without relying on the
+    // session header being present in every chunk.
+    {
+        int fd = open("/log/upload.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd >= 0) {
+            char header[256];
+            int len = snprintf(header, sizeof(header),
+                "0|======== UPLOAD METADATA ========\n"
+                "0|Boot #%d | Device: %s\n"
+                "0|Firmware: v%d | Format: v%d\n"
+                "0|================================\n",
+                eeprom.cp_boot_count, device_id.c_str(),
+                FIRMWARE_VERSION, DATA_FORMAT_VERSION);
+            write(fd, header, len);
+
+            // Append the actual log content
+            int src = open("/log/session.old.txt", O_RDONLY);
+            if (src >= 0) {
+                char buf[512];
+                int n;
+                while ((n = read(src, buf, sizeof(buf))) > 0) {
+                    write(fd, buf, n);
+                }
+                close(src);
+            }
+            close(fd);
+        }
+    }
+
+    // Load and publish
+    event.clear();
+    event.name("device-log");
+    event.contentType(ContentType::BINARY);
+    event.loadData("/log/upload.txt");
+
+    if (event.data().size() == 0) {
+        Log.info("Failed to load session log for upload");
+        return;
+    }
+
+    if (event.canPublish(event.size())) {
+        Log.info("Uploading session log (%d bytes)", event.size());
+        lastPublish = millis();
+        log_upload_pending = true;
+        log_upload_started = millis();
+        Particle.publish(event);
+    } else {
+        Log.info("Session log too large to publish (%d bytes)", event.size());
+    }
+
+    // Clean up temp file
+    unlink("/log/upload.txt");
+}
+
+/////////////////////////////////////////////////////
 //            SUBSCRIPTION MANAGEMENT              //
 /////////////////////////////////////////////////////
 
 /**
  * @brief Register all Particle cloud subscriptions
- * 
+ *
  * This function registers all webhook response and error subscriptions.
  * Should be called during setup() and when connection is restored.
  */
+/**
+ * Unified webhook response dispatcher.
+ *
+ * All webhook responses arrive as: {device_id}/hook-response/{event_name}
+ * A single prefix subscription catches all of them, then we dispatch
+ * to the existing handler functions based on the event name.
+ *
+ * This uses 1 of 4 available Particle.subscribe() slots instead of 4,
+ * leaving room for future subscriptions.
+ */
+void response_webhook(const char *event_name, const char *data)
+{
+    device_log("Webhook response: %s (data len: %d)", event_name, data ? (int)strlen(data) : 0);
+
+    if (strstr(event_name, "validate-cartridge")) {
+        response_validate_cartridge(event_name, data);
+    } else if (strstr(event_name, "load-assay")) {
+        response_load_assay(event_name, data);
+    } else if (strstr(event_name, "upload-test")) {
+        response_upload_test(event_name, data);
+    } else if (strstr(event_name, "reset-cartridge")) {
+        response_reset_cartridge(event_name, data);
+    } else if (strstr(event_name, "device-log")) {
+        response_device_log(event_name, data);
+    } else {
+        device_log("Unknown webhook response: %s", event_name);
+    }
+}
+
 void register_cloud_subscriptions()
 {
-    String validation_topic = String(device_id + "/hook-response/validate-cartridge/");
-    
-    // Success responses
-    bool sub1 = Particle.subscribe(String(device_id + "/hook-response/load-assay/"), response_load_assay);
-    bool sub2 = Particle.subscribe(validation_topic, response_validate_cartridge);
-    bool sub3 = Particle.subscribe(String(device_id + "/hook-response/reset-cartridge/"), response_reset_cartridge);
-    bool sub4 = Particle.subscribe(String(device_id + "/hook-response/upload-test/"), response_upload_test);
-    
-    // Log subscription status
-    Log.info("Subscriptions registered - Load: %s, Validate: %s, Reset: %s, Upload: %s",
-             sub1 ? "OK" : "FAIL", sub2 ? "OK" : "FAIL", sub3 ? "OK" : "FAIL", sub4 ? "OK" : "FAIL");
-    Log.info("Validation subscription: %s (topic: %s)", 
-             sub2 ? "OK" : "FAILED", validation_topic.c_str());
+    String topic = String(device_id + "/hook-response/");
+
+    bool sub = Particle.subscribe(topic, response_webhook);
+
+    device_log("Webhook subscription: %s (topic: %s)", sub ? "OK" : "FAIL", topic.c_str());
 }
 
 
@@ -2276,81 +2510,11 @@ void publish_validate_cartridge()
         // === CHECK CLOUD CONNECTION ===
         if (!Particle.connected())
         {
-            Log.error("Cannot publish validation: not connected to Particle cloud");
-            
-            // If we have retries left, don't set error yet - wait for connection to restore
-            if (validation_retry_count < VALIDATION_MAX_RETRIES)
-            {
-                // Clear any pending cloud operation since we're not connected
-                if (device_state.cloud_operation_pending)
-                {
-                    device_state.end_cloud_operation();
-                }
-                
-                // Set retry delay to check connection again
-                unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * (validation_retry_count + 1);
-                validation_retry_delay_until = millis() + backoff_delay;
-                Log.info("Cloud disconnected, will retry connection check in %lu ms (attempt %d/%d)", 
-                         backoff_delay, validation_retry_count + 1, VALIDATION_MAX_RETRIES);
-                return;
-            }
-            else
-            {
-                // Max retries exceeded - clear cloud operation and set error
-                if (device_state.cloud_operation_pending)
-                {
-                    device_state.end_cloud_operation();
-                }
-                device_state.set_error("No cloud connection for validation");
-                validation_retry_count = 0;
-                validation_retry_delay_until = 0;
-                validation_request_id = "";
-                return;
-            }
-        }
-
-        // === CHECK IF WAITING FOR RETRY DELAY ===
-        // Use safe comparison that handles millis() overflow
-        bool waiting_for_retry = false;
-        if (validation_retry_delay_until > 0)
-        {
-            unsigned long current_time = millis();
-            // Handle millis() overflow: if delay time is in the past (wrapped around),
-            // consider the delay as elapsed
-            if (validation_retry_delay_until > current_time)
-            {
-                // Normal case: delay time is in the future
-                unsigned long remaining_delay = validation_retry_delay_until - current_time;
-                static unsigned long last_retry_delay_log = 0;
-                if (last_retry_delay_log == 0 || (current_time - last_retry_delay_log) >= 5000) // Log every 5 seconds
-                {
-                    Log.info("Waiting for retry delay - %lu ms remaining (attempt %d/%d)", 
-                             remaining_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-                    last_retry_delay_log = current_time;
-                }
-                waiting_for_retry = true;
-            }
-            // If delay time <= current_time, delay has elapsed or overflowed - proceed
-        }
-        
-        if (waiting_for_retry)
-        {
+            device_log("Cannot publish validation: not connected to Particle cloud");
+            device_state.set_error("No cloud connection for validation");
             return;
         }
-        
-        // === CLEAR RETRY DELAY IF IT HAS ELAPSED ===
-        if (validation_retry_delay_until > 0)
-        {
-            Log.info("Retry delay elapsed - proceeding with retry attempt %d/%d", 
-                     validation_retry_count, VALIDATION_MAX_RETRIES);
-            validation_retry_delay_until = 0; // Clear the delay flag
-        }
 
-        // === GENERATE REQUEST ID FOR CORRELATION ===
-        // Create unique request ID: device_id + timestamp + retry_count
-        validation_request_id = String(device_id) + "-" + String(millis()) + "-" + String(validation_retry_count);
-        Log.info("Validation request ID: %s", validation_request_id.c_str());
-        
         // === PREPARE CLOUD EVENT ===
         lastPublish = millis();
         clear_payload_buffer();
@@ -2358,87 +2522,35 @@ void publish_validate_cartridge()
         event.name("validate-cartridge");
         event.contentType(ContentType::STRUCTURED);
         data.set("uuid", barcode_uuid);
-        data.set("requestId", validation_request_id);  // Include request ID for correlation
         event.data(data);
-        
+
         // === VERIFY EVENT CAN BE PUBLISHED ===
         if (!event.canPublish(event.size()))
         {
-            Log.error("Cannot publish validation: event size too large (%d bytes)", event.size());
-            
-            // Clear any pending cloud operation
-            if (device_state.cloud_operation_pending)
-            {
-                device_state.end_cloud_operation();
-            }
-            
-            // This is a non-retryable error (event too large)
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";
+            device_log("Cannot publish validation: event size too large (%d bytes)", event.size());
             device_state.cartridge_state = CartridgeState::INVALID;
             device_state.set_error("Validation event too large");
             return;
         }
 
         // === ATTEMPT TO PUBLISH ===
-        Log.info("Publishing validate cartridge, %s (attempt %d/%d)", 
-                 barcode_uuid, validation_retry_count + 1, VALIDATION_MAX_RETRIES + 1);
-        
+        device_log("Publishing validate cartridge, %s", barcode_uuid);
+        checkpoint(CP_CLOUD_PUBLISH_VALIDATE);
+
         bool publish_success = Particle.publish(event);
-        
-        // === VERIFY PUBLISH SUCCESS ===
+
         if (!publish_success)
         {
-            Log.error("Publish failed for validate cartridge, %s", barcode_uuid);
-            
-            // Increment retry count
-            validation_retry_count++;
-            
-            if (validation_retry_count <= VALIDATION_MAX_RETRIES)
-            {
-                // Calculate exponential backoff delay
-                unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
-                validation_retry_delay_until = millis() + backoff_delay;
-                Log.info("Publish failed, will retry in %lu ms (attempt %d/%d)", 
-                         backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-            }
-            else
-            {
-                // Max retries exceeded - clear any pending cloud operation and set error
-                Log.error("Publish failed after %d attempts - giving up", VALIDATION_MAX_RETRIES + 1);
-                
-                // Ensure cloud operation is cleared
-                if (device_state.cloud_operation_pending)
-                {
-                    device_state.end_cloud_operation();
-                }
-                
-                validation_retry_count = 0;
-                validation_retry_delay_until = 0;
-                validation_request_id = "";
-                device_state.cartridge_state = CartridgeState::INVALID;
-                device_state.set_error("Validation publish failed after retries");
-            }
+            device_log("Publish failed for validate cartridge, %s", barcode_uuid);
+            device_state.cartridge_state = CartridgeState::INVALID;
+            device_state.set_error("Validation publish failed");
             return;
         }
 
         // === PUBLISH SUCCESSFUL - START CLOUD OPERATION TRACKING ===
-        if (validation_retry_count > 0)
-        {
-            Log.info("Validation publish successful (retry attempt %d/%d), waiting for response", 
-                     validation_retry_count, VALIDATION_MAX_RETRIES);
-        }
-        else
-        {
-            Log.info("Validation publish successful, waiting for response");
-        }
+        checkpoint(CP_CLOUD_PUBLISH_VALIDATE_OK);
+        device_log("Validation publish successful, waiting for response");
         device_state.start_cloud_operation();
-        
-        // Reset retry tracking on successful publish
-        // Note: Don't reset retry_count here - keep it for logging until we get a response
-        // It will be reset in response_validate_cartridge() on success
-        validation_retry_delay_until = 0;
     }
 }
 
@@ -2455,180 +2567,72 @@ void response_validate_cartridge(const char *event_name, const char *data)
 {
     String event_data = String(data);
 
-    Log.info("Validation response received - Event: %s, Data length: %d, Current mode: %s",
+    checkpoint(CP_WEBHOOK_RESPONSE_RECEIVED);
+    device_log("Validation response received - Event: %s, Data length: %d, Current mode: %s",
              event_name, event_data.length(),
              device_mode_to_string(device_state.mode).c_str());
-    
+
     // === CHECK IF DEVICE IS IN VALID STATE FOR VALIDATION RESPONSE ===
-    // Ignore validation responses if we're not in VALIDATING_CARTRIDGE mode
-    // This prevents invalid state transitions if response arrives late (e.g., during UPLOADING_RESULTS)
     if (device_state.mode != DeviceMode::VALIDATING_CARTRIDGE)
     {
-        Log.warn("Validation response received but device is in %s mode (expected VALIDATING_CARTRIDGE) - ignoring stale response",
+        device_log("Validation response received but device is in %s mode (expected VALIDATING_CARTRIDGE) - ignoring stale response",
                  device_mode_to_string(device_state.mode).c_str());
-        return;  // Ignore response - device is no longer waiting for validation
+        return;
     }
-    
-    // === PARSE CLOUD RESPONSE (single parse, reused for ID check and processing) ===
-    // Check if event data is valid
+
+    // === CHECK IF EVENT DATA IS VALID ===
     if (event_data.length() == 0)
     {
-        Log.error("Validation response is empty");
-
-        // Check if we can retry on empty response (might be transient)
-        if (validation_retry_count < VALIDATION_MAX_RETRIES)
-        {
-            validation_retry_count++;
-            unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
-            validation_retry_delay_until = millis() + backoff_delay;
-            validation_request_id = "";  // Clear for retry
-
-            Log.warn("Empty validation response, will retry in %lu ms (attempt %d/%d)",
-                     backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-            return;
-        }
-
-        // Max retries exceeded
+        device_log("Validation response is empty");
         device_state.cartridge_state = CartridgeState::INVALID;
         device_state.set_error("Empty validation response");
-        validation_retry_count = 0;
-        validation_retry_delay_until = 0;
-        validation_request_id = "";
         return;
     }
 
     Variant json = Variant::fromJSON(event_data);
 
-    // Check if JSON parsing was successful
     if (json.isNull())
     {
-        Log.error("JSON parsing failed. Data: %s", event_data.c_str());
-        
-        // Check if we can retry on parse failure (might be transient malformed response)
-        if (validation_retry_count < VALIDATION_MAX_RETRIES)
-        {
-            validation_retry_count++;
-            unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
-            validation_retry_delay_until = millis() + backoff_delay;
-            validation_request_id = "";  // Clear for retry
-            
-            Log.warn("Invalid validation response format, will retry in %lu ms (attempt %d/%d)", 
-                     backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-            return;
-        }
-        
-        // Max retries exceeded
+        device_log("JSON parsing failed. Data: %s", event_data.c_str());
         device_state.cartridge_state = CartridgeState::INVALID;
         device_state.set_error("Invalid validation response format");
-        validation_retry_count = 0;
-        validation_retry_delay_until = 0;
-        validation_request_id = "";
         return;
-    }
-
-    // === VERIFY REQUEST ID MATCH ===
-    // Check if response matches current request (using already-parsed json)
-    if (validation_request_id.length() > 0)
-    {
-        String response_request_id = json.get("requestId").toString();
-
-        if (response_request_id.length() > 0 && response_request_id != validation_request_id)
-        {
-            Log.warn("Response request ID mismatch - Expected: %s, Received: %s. Ignoring stale response.",
-                     validation_request_id.c_str(), response_request_id.c_str());
-            return;  // Ignore response that doesn't match current request
-        }
-        else if (response_request_id.length() == 0)
-        {
-            // Request ID missing - use cartridgeId as fallback verification
-            String response_cartridge_id = json.get("cartridgeId").toString();
-
-            if (response_cartridge_id.length() > 0 && response_cartridge_id == barcode_uuid)
-            {
-                Log.info("Response missing request ID but cartridgeId matches current barcode - accepting response");
-            }
-            else if (response_cartridge_id.length() == 0)
-            {
-                Log.warn("Response missing both request ID and cartridgeId - may be from old request. Current ID: %s, Current barcode: %s",
-                         validation_request_id.c_str(), barcode_uuid);
-                // Continue processing but log warning
-            }
-            else
-            {
-                Log.warn("Response missing request ID and cartridgeId mismatch - Expected: %s, Received: %s. Ignoring stale response.",
-                         barcode_uuid, response_cartridge_id.c_str());
-                return;  // Ignore response that doesn't match current cartridge
-            }
-        }
-        else
-        {
-            Log.info("Response request ID verified: %s", response_request_id.c_str());
-        }
     }
 
     // === END CLOUD OPERATION TRACKING ===
     device_state.end_cloud_operation();
 
-    // === RESET RETRY TRACKING ON RESPONSE ===
-    validation_retry_count = 0;
-    validation_retry_delay_until = 0;
-    validation_request_id = "";  // Clear request ID after successful response
-
     String status = json.get("status").toString();
-    Log.info("Validation response status: %s", status.c_str());
-    
+    device_log("Validation response status: %s", status.c_str());
+
     if (status == "SUCCESS")
     {
         // === CARTRIDGE VALIDATION SUCCESSFUL ===
         String assay_id = json.get("assayId").toString();
         int checksum_value = json.get("checksum").toInt();
         String cartridge_id = json.get("cartridgeId").toString();
-        Log.info("Cartridge validation successful, assay ID: %s, checksum: %d", assay_id.c_str(), checksum_value);
+        device_log("Cartridge validation successful, assay ID: %s, checksum: %d", assay_id.c_str(), checksum_value);
 
         // === LOAD ASSAY FROM FILE ===
         bool assay_loaded = load_assay_from_file(assay_id, checksum_value);
-        
+
         if (assay_loaded)
         {
             // === ASSAY LOADED SUCCESSFULLY ===
-            // Mode was already validated at the beginning of this function
-            // Proceed with transition to RUNNING_TEST
             device_state.cartridge_state = CartridgeState::VALIDATED;
             device_state.test_state = TestState::NOT_STARTED;
             strcpy(test.cartridge_id, cartridge_id.c_str());
-            
+
             device_state.transition_to(DeviceMode::RUNNING_TEST);
-            
+
             run_test();
         }
         else
         {
-            // === ASSAY LOAD FAILED - TRY RE-DOWNLOAD ===
-            Log.warn("Assay file checksum mismatch - attempting to re-download assay");
-            
-            // Delete the corrupted file
-            String filename = "/assay/" + assay_id;
-            if (unlink(filename.c_str()) == 0)
-            {
-                Log.info("Deleted corrupted assay file: %s", filename.c_str());
-            }
-            else
-            {
-                Log.warn("Failed to delete assay file: %s (errno: %d)", filename.c_str(), errno);
-            }
-            
-            // Store validation data for retry after re-download
-            strcpy(pending_assay_id, assay_id.c_str());
-            pending_checksum = checksum_value;
-            strcpy(pending_cartridge_id, json.get("cartridgeId").toString().c_str());
-            assay_redownload_pending = true;
-            
-            // Start cloud operation for assay download
-            device_state.start_cloud_operation();
-            
-            // Trigger assay re-download
-            Log.info("Requesting re-download of assay: %s", assay_id.c_str());
-            publish_load_assay(assay_id);
+            // === ASSAY FILE MISSING OR CORRUPTED ===
+            device_log("Assay file missing or corrupted for assay ID: %s", assay_id.c_str());
+            device_state.cartridge_state = CartridgeState::INVALID;
+            device_state.set_error("Assay file missing or corrupted");
         }
     }
     else
@@ -2637,7 +2641,7 @@ void response_validate_cartridge(const char *event_name, const char *data)
         String failure_cartridge_id = json.get("cartridgeId").toString();
         String failure_error = json.get("errorMessage").toString();
         device_state.cartridge_state = CartridgeState::INVALID;
-        
+
         // Use the error message from the response if available
         if (failure_error.length() > 0)
         {
@@ -2646,26 +2650,28 @@ void response_validate_cartridge(const char *event_name, const char *data)
             if (failure_error.indexOf("already used") >= 0 || failure_error.indexOf("already tested") >= 0)
             {
                 error_msg = "Cartridge already used - cannot test again";
-                Log.error("Cartridge validation failed: Cartridge already used (barcode: %s)", failure_cartridge_id.c_str());
+                device_log("Cartridge validation failed: Cartridge already used (barcode: %s)", failure_cartridge_id.c_str());
             }
             else if (failure_error.indexOf("missing") >= 0 || failure_error.indexOf("deleted") >= 0)
             {
                 error_msg = "Cartridge not found in database";
-                Log.error("Cartridge validation failed: Cartridge not found (barcode: %s)", failure_cartridge_id.c_str());
+                device_log("Cartridge validation failed: Cartridge not found (barcode: %s)", failure_cartridge_id.c_str());
             }
             else
             {
                 error_msg = "Cartridge validation failed: " + failure_error;
-                Log.error("Cartridge validation failed: %s", failure_error.c_str());
+                device_log("Cartridge validation failed: %s", failure_error.c_str());
             }
             device_state.set_error(error_msg);
         }
         else
         {
             device_state.set_error("Cartridge validation failed");
-            Log.info("Cartridge validation failed (no error message provided)");
+            device_log("Cartridge validation failed (no error message provided)");
         }
     }
+
+    flush_log_to_file();
 }
 
 /////////////////////////////////////////////////////
@@ -2699,8 +2705,10 @@ void publish_reset_cartridge()
         // === PUBLISH IF POSSIBLE ===
         if (event.canPublish(event.size()))
         {
-            Log.info("Publishing reset cartridge, %s", reset_uuid);
+            device_log("Publishing reset cartridge, %s", reset_uuid);
+            checkpoint(CP_CLOUD_PUBLISH_RESET);
             Particle.publish(event);
+            checkpoint(CP_CLOUD_PUBLISH_RESET_OK);
         }
     }
 }
@@ -2716,6 +2724,7 @@ void publish_reset_cartridge()
  */
 void response_reset_cartridge(const char *event_name, const char *data)
 {
+    checkpoint(CP_WEBHOOK_RESPONSE_RECEIVED);
     // === END CLOUD OPERATION TRACKING ===
     device_state.end_cloud_operation();
 
@@ -2725,18 +2734,14 @@ void response_reset_cartridge(const char *event_name, const char *data)
     {
         // === CARTRIDGE RESET SUCCESSFUL ===
         String cartridge_id = json.get("cartridgeId").toString();
-        Log.info("Cartridge reset successful: %s", cartridge_id.c_str());
+        device_log("Cartridge reset successful: %s", cartridge_id.c_str());
         memset(reset_uuid, 0, BARCODE_UUID_LENGTH + 1);
-        
-        // === CLEANUP VALIDATION RETRY TRACKING FOR NEXT TEST ===
-        validation_retry_count = 0;
-        validation_retry_delay_until = 0;
-        validation_request_id = "";
+
         if (device_state.cloud_operation_pending)
         {
             device_state.end_cloud_operation();
         }
-        
+
         // Clear pending barcode state
         pending_barcode_available = false;
         pending_barcode_uuid[0] = '\0';
@@ -2746,14 +2751,16 @@ void response_reset_cartridge(const char *event_name, const char *data)
     else
     {
         // === CARTRIDGE RESET FAILED ===
-        Log.info("Cartridge reset failed");
+        device_log("Cartridge reset failed");
         String errorMessage = json.get("errorMessage").toString();
         if (errorMessage.length() > 0)
         {
-            Log.info("Cartridge reset error: %s", errorMessage.c_str());
+            device_log("Cartridge reset error: %s", errorMessage.c_str());
         }
         device_state.set_error("Cartridge reset failed");
     }
+
+    flush_log_to_file();
 }
 
 /////////////////////////////////////////////////////
@@ -2778,10 +2785,21 @@ void publish_load_assay(String assay_to_load)
         event.data(data);
         if (event.canPublish(event.size()))
         {
-            Log.info("Publishing load assay, %s", assay_to_load.c_str());
+            device_log("Publishing load assay, %s", assay_to_load.c_str());
+            checkpoint(CP_CLOUD_PUBLISH_LOAD_ASSAY);
             Particle.publish(event);
+            checkpoint(CP_CLOUD_PUBLISH_LOAD_ASSAY_OK);
+        }
+        else
+        {
+            device_log("publish_load_assay FAILED: canPublish returned false (size=%d)", event.size());
         }
         assay_to_load = ""; // reset assay_to_load after publishing
+    }
+    else
+    {
+        device_log("publish_load_assay BLOCKED: isSending=%d, timeSinceLastPublish=%lu ms",
+                  event.isSending(), millis() - lastPublish);
     }
 }
 
@@ -2827,17 +2845,29 @@ bool all_payloads_received()
 
 void response_load_assay(const char *event_name, const char *data)
 {
+    checkpoint(CP_WEBHOOK_RESPONSE_RECEIVED);
     String name = String(event_name);
     int data_len = strlen(data);
-    Log.info("response_load_assay event: name=%s, size=%d", event_name, data_len);
+    device_log("response_load_assay event: name=%s, size=%d", event_name, data_len);
     String final_result;
 
     int index = limit(name.substring(name.length() - 1).toInt(), PARTICLE_PAYLOAD_BUFFER_SIZE - 1, 0);
     Log.info("response_load_assay data size: %d, index: %d", data_len, index);
 
+    // Clear stale buffer data when first chunk of a new response arrives
+    if (index == 0) {
+        clear_payload_buffer();
+    }
     payload_buffer[index] = String(data);
     if (!all_payloads_received())
+    {
+        int filled = 0;
+        for (int i = 0; i < PARTICLE_PAYLOAD_BUFFER_SIZE; i++)
+            if (payload_buffer[i].length() > 0) filled++;
+        Log.info("response_load_assay: chunk %d arrived (%d bytes), %d/%d buffer slots filled, waiting for more...",
+                 index, data_len, filled, PARTICLE_PAYLOAD_BUFFER_SIZE);
         return;
+    }
 
     for (int ii = 0; ii < PARTICLE_PAYLOAD_BUFFER_SIZE; ii++)
     {
@@ -2851,146 +2881,43 @@ void response_load_assay(const char *event_name, const char *data)
     {
         strcpy(assay.id, json.get("assayId").toString().c_str());
         strcpy(test.assay_id, assay.id);
-        Log.info("Assay ID: %s", assay.id);
+        device_log("Assay ID: %s", assay.id);
 
         int crc_loaded = json.get("checksum").toUInt();
-        Log.info("checksum: %d", crc_loaded);
+        device_log("checksum: %d", crc_loaded);
 
         strcpy(assay.BCODE, json.get("bcode").toString().c_str());
         assay.BCODE_length = strlen(assay.BCODE);
-        Log.info("BCODE : %s", assay.BCODE);
+        device_log("BCODE : %s", assay.BCODE);
 
         assay.duration = json.get("duration").toInt();
-        Log.info("duration: %d", assay.duration);
+        device_log("duration: %d", assay.duration);
 
         int crc_calculated = abs((int)checksum(assay.BCODE, strlen(assay.BCODE)));
-        Log.info("crc_loaded: %d, crc_calculated: %d", crc_loaded, crc_calculated);
+        device_log("crc_loaded: %d, crc_calculated: %d", crc_loaded, crc_calculated);
         if (crc_loaded == crc_calculated)
         {
             if (save_assay_to_file())
             {
-                Log.info("Assay %s %s", assay.id, "loaded successfully");
-                
-                // === CHECK IF WE NEED TO RETRY VALIDATION AFTER RE-DOWNLOAD ===
-                if (assay_redownload_pending && strcmp(assay.id, pending_assay_id) == 0)
-                {
-                    Log.info("Assay re-downloaded successfully, retrying validation");
-                    
-                    // End cloud operation for assay download
-                    device_state.end_cloud_operation();
-                    
-                    // Try loading the assay again with the expected checksum
-                    if (load_assay_from_file(pending_assay_id, pending_checksum))
-                    {
-                        // === ASSAY LOADED SUCCESSFULLY AFTER RE-DOWNLOAD ===
-                        // Only transition to RUNNING_TEST if we're still in VALIDATING_CARTRIDGE mode
-                        // This prevents invalid transitions if assay re-download completes late
-                        if (device_state.mode != DeviceMode::VALIDATING_CARTRIDGE)
-                        {
-                            Log.warn("Assay re-download completed but device is in %s mode (expected VALIDATING_CARTRIDGE) - ignoring",
-                                     device_mode_to_string(device_state.mode).c_str());
-                            // Clear re-download tracking
-                            assay_redownload_pending = false;
-                            pending_assay_id[0] = '\0';
-                            pending_checksum = 0;
-                            pending_cartridge_id[0] = '\0';
-                            return;  // Ignore stale assay re-download
-                        }
-                        
-                        Log.info("Assay loaded successfully after re-download");
-                        device_state.cartridge_state = CartridgeState::VALIDATED;
-                        device_state.test_state = TestState::NOT_STARTED;
-                        strcpy(test.cartridge_id, pending_cartridge_id);
-                        device_state.transition_to(DeviceMode::RUNNING_TEST);
-                        
-                        // Clear re-download tracking
-                        assay_redownload_pending = false;
-                        pending_assay_id[0] = '\0';
-                        pending_checksum = 0;
-                        pending_cartridge_id[0] = '\0';
-                        
-                        run_test();
-                    }
-                    else
-                    {
-                        // Still failed after re-download
-                        Log.error("Assay still failed to load after re-download");
-                        device_state.cartridge_state = CartridgeState::INVALID;
-                        device_state.set_error("Could not load assay from file after re-download");
-                        memcpy(reset_uuid, barcode_uuid, BARCODE_UUID_LENGTH + 1);
-                        device_state.transition_to(DeviceMode::RESETTING_CARTRIDGE);
-                        
-                        // Clear re-download tracking
-                        assay_redownload_pending = false;
-                        pending_assay_id[0] = '\0';
-                        pending_checksum = 0;
-                        pending_cartridge_id[0] = '\0';
-                    }
-                }
+                device_log("Assay %s %s", assay.id, "loaded successfully");
             }
             else
             {
-                Log.info("Assay %s %s", assay.id, "saved to file failed");
-                
-                // If this was a re-download attempt, handle failure
-                if (assay_redownload_pending)
-                {
-                    device_state.end_cloud_operation();
-                    device_state.cartridge_state = CartridgeState::INVALID;
-                    device_state.set_error("Failed to save assay file after re-download");
-                    memcpy(reset_uuid, barcode_uuid, BARCODE_UUID_LENGTH + 1);
-                    device_state.transition_to(DeviceMode::RESETTING_CARTRIDGE);
-                    
-                    // Clear re-download tracking
-                    assay_redownload_pending = false;
-                    pending_assay_id[0] = '\0';
-                    pending_checksum = 0;
-                    pending_cartridge_id[0] = '\0';
-                }
+                device_log("Assay %s %s", assay.id, "saved to file failed");
             }
         }
         else
         {
-            Log.info("Assay %s %s", assay.id, "loaded but checksum mismatch");
-            Log.info("CRC loaded: %d, CRC calculated: %d", crc_loaded, crc_calculated);
-            
-            // If this was a re-download attempt, handle failure
-            if (assay_redownload_pending)
-            {
-                device_state.end_cloud_operation();
-                device_state.cartridge_state = CartridgeState::INVALID;
-                device_state.set_error("Assay checksum mismatch after re-download");
-                memcpy(reset_uuid, barcode_uuid, BARCODE_UUID_LENGTH + 1);
-                device_state.transition_to(DeviceMode::RESETTING_CARTRIDGE);
-                
-                // Clear re-download tracking
-                assay_redownload_pending = false;
-                pending_assay_id[0] = '\0';
-                pending_checksum = 0;
-                pending_cartridge_id[0] = '\0';
-            }
+            device_log("Assay %s %s", assay.id, "loaded but checksum mismatch");
+            device_log("CRC loaded: %d, CRC calculated: %d", crc_loaded, crc_calculated);
         }
     }
     else
     {
-        Log.info("Assay %s %s", assay.id, "loading failed");
-        
-        // If this was a re-download attempt, handle failure
-        if (assay_redownload_pending)
-        {
-            device_state.end_cloud_operation();
-            device_state.cartridge_state = CartridgeState::INVALID;
-            device_state.set_error("Assay download failed");
-            memcpy(reset_uuid, barcode_uuid, BARCODE_UUID_LENGTH + 1);
-            device_state.transition_to(DeviceMode::RESETTING_CARTRIDGE);
-            
-            // Clear re-download tracking
-            assay_redownload_pending = false;
-            pending_assay_id[0] = '\0';
-            pending_checksum = 0;
-            pending_cartridge_id[0] = '\0';
-        }
+        device_log("Assay %s %s", assay.id, "loading failed");
     }
+
+    flush_log_to_file();
 }
 
 /////////////////////////////////////////////////////
@@ -3013,12 +2940,8 @@ void publish_upload_test()
         if (!test_in_cache())
         {
             // No more tests to upload - transition back to IDLE
-            Log.info("No test in cache - transitioning to IDLE");
+            device_log("No test in cache - transitioning to IDLE");
 
-            // === CLEANUP VALIDATION RETRY TRACKING FOR NEXT TEST ===
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";
             if (device_state.cloud_operation_pending)
             {
                 device_state.end_cloud_operation();
@@ -3035,7 +2958,7 @@ void publish_upload_test()
         // === CHECK CLOUD CONNECTION ===
         if (!Particle.connected())
         {
-            Log.error("Cannot publish upload test: not connected to Particle cloud");
+            device_log("Cannot publish upload test: not connected to Particle cloud");
             device_state.set_error("No cloud connection for upload");
             return;
         }
@@ -3055,7 +2978,7 @@ void publish_upload_test()
         // === VERIFY DATA LOADED SUCCESSFULLY ===
         if (event.data().size() == 0)
         {
-            Log.error("Failed to load test data from cache file: %s", cached_filename);
+            device_log("Failed to load test data from cache file: %s", cached_filename);
             device_state.end_cloud_operation();
             device_state.set_error("Failed to load cached test data");
             return;
@@ -3064,12 +2987,14 @@ void publish_upload_test()
         // === PUBLISH IF POSSIBLE ===
         if (event.canPublish(event.size()))
         {
-            Log.info("Publishing upload test, %s (%d bytes)", cached_filename, event.size());
+            device_log("Publishing upload test, %s (%d bytes)", cached_filename, event.size());
+            checkpoint(CP_CLOUD_PUBLISH_UPLOAD);
             Particle.publish(event);
+            checkpoint(CP_CLOUD_PUBLISH_UPLOAD_OK);
         }
         else
         {
-            Log.error("Cannot publish upload test: event too large (%d bytes)", event.size());
+            device_log("Cannot publish upload test: event too large (%d bytes)", event.size());
             device_state.end_cloud_operation();
             device_state.set_error("Upload test event too large to publish");
         }
@@ -3087,6 +3012,7 @@ void publish_upload_test()
  */
 void response_upload_test(const char *event_name, const char *data)
 {
+    checkpoint(CP_WEBHOOK_RESPONSE_RECEIVED);
     // === CHECK IF DEVICE IS IN VALID STATE FOR UPLOAD RESPONSE ===
     // Only process upload responses when in UPLOADING_RESULTS mode
     // This prevents duplicate processing if response arrives multiple times or after state change
@@ -3094,7 +3020,7 @@ void response_upload_test(const char *event_name, const char *data)
     if (device_state.mode != DeviceMode::UPLOADING_RESULTS)
     {
         // Use INFO level instead of WARN since stale responses are expected after cloud reconnection
-        Log.info("Upload response received but device is in %s mode (expected UPLOADING_RESULTS) - ignoring stale response",
+        device_log("Upload response received but device is in %s mode (expected UPLOADING_RESULTS) - ignoring stale response",
                  device_mode_to_string(device_state.mode).c_str());
         return;  // Ignore response - device is no longer uploading
     }
@@ -3115,50 +3041,45 @@ void response_upload_test(const char *event_name, const char *data)
         // Activate buzzer to signal cartridge removal if cartridge is still inserted
         if (device_state.detector_on)
         {
-            Log.info("Test uploaded successfully - activating buzzer for cartridge removal");
+            device_log("Test uploaded successfully - activating buzzer for cartridge removal");
             turn_on_buzzer_alert();
         }
         else
         {
-            Log.info("Test uploaded successfully but cartridge already removed - no buzzer needed");
+            device_log("Test uploaded successfully but cartridge already removed - no buzzer needed");
         }
-        
+
         if (cartridgeId.length() == BARCODE_UUID_LENGTH)
         {
             // === CLEAN UP CACHE ===
             unlink("/cache/" + cartridgeId);
-            Log.info("Uploaded test successful, %s removed from cache", cartridgeId.c_str());
-            
+            device_log("Uploaded test successful, %s removed from cache", cartridgeId.c_str());
+
             // === TRACK RECENTLY TESTED BARCODE ===
             // Store this barcode as recently tested to prevent immediate re-scanning
             strncpy(last_tested_barcode, cartridgeId.c_str(), BARCODE_UUID_LENGTH);
             last_tested_barcode[BARCODE_UUID_LENGTH] = '\0';
             last_tested_timestamp = millis();
-            Log.info("Barcode %s marked as recently tested (cooldown: %lu ms)", 
+            device_log("Barcode %s marked as recently tested (cooldown: %lu ms)",
                      last_tested_barcode, (unsigned long)RECENT_TEST_COOLDOWN_MS);
         }
         else
         {
-            Log.info("Uploaded test successful, but %s not removed from cache (invalid length)", cartridgeId.c_str());
+            device_log("Uploaded test successful, but %s not removed from cache (invalid length)", cartridgeId.c_str());
         }
-        
+
         // === CHECK FOR MORE CACHED TESTS ===
         // Stay in UPLOADING_RESULTS if more tests need to be uploaded
         if (test_in_cache())
         {
-            Log.info("More cached tests found, continuing upload");
+            device_log("More cached tests found, continuing upload");
             // Stay in UPLOADING_RESULTS mode - don't transition to IDLE yet
         }
         else
         {
             // No more cached tests - safe to transition to IDLE
-            Log.info("All cached tests uploaded");
-            
-            // === CLEANUP VALIDATION RETRY TRACKING FOR NEXT TEST ===
-            // Reset validation retry variables to ensure clean state for next cartridge
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";
+            device_log("All cached tests uploaded");
+
             if (device_state.cloud_operation_pending)
             {
                 device_state.end_cloud_operation();
@@ -3217,15 +3138,17 @@ void response_upload_test(const char *event_name, const char *data)
     else
     {
         // === TEST UPLOAD FAILED ===
-        Log.info("Uploaded test invalid");
+        device_log("Uploaded test invalid");
         device_state.set_error("Test upload failed");
     }
     // === GET ERROR MESSAGE IF AVAILABLE ===
     String errorMessage = json.get("errorMessage").toString();
     if (errorMessage.length() > 0)
     {
-        Log.info("Cancel test error: %s", errorMessage.c_str());
+        device_log("Upload test error: %s", errorMessage.c_str());
     }
+
+    flush_log_to_file();
 }
 
 /////////////////////////////////////////////////////////////
@@ -3283,7 +3206,7 @@ void BCODE_loop()
         }
         if (device_state.test_state == TestState::CANCELLED)
         {
-            Log.info("Cartridge removed, cancelling test");
+            device_log("Cartridge removed, cancelling test");
         }
     }
 }
@@ -3335,6 +3258,21 @@ int process_one_BCODE_command(int cmd, int index)
         Log.info("Oscillate %d microns, %d µs, %d cycles", param1, param2, param3);
         oscillate_stage(param1, param2, param3, true);
         break;
+    case 4:                                      // Sinusoidal Oscillate(microns, peak_delay_us, shape_pct, cycles)
+        index = get_BCODE_token(index, &param1); // microns amplitude
+        index = get_BCODE_token(index, &param2); // peak_delay_us
+        index = get_BCODE_token(index, &param3); // shape_pct (100 = pure sine)
+        index = get_BCODE_token(index, &param4); // number of cycles
+        Log.info("Sinusoidal oscillate %d um, %d us peak, shape %d%%, %d cycles", param1, param2, param3, param4);
+        oscillate_stage_sinusoidal(param1, param2, param3, param4, true);
+        break;
+    case 5:                                      // Sinusoidal Move(microns, peak_delay_us, shape_pct)
+        index = get_BCODE_token(index, &param1); // microns (positive or negative)
+        index = get_BCODE_token(index, &param2); // peak_delay_us
+        index = get_BCODE_token(index, &param3); // shape_pct (100 = pure sine)
+        Log.info("Sinusoidal move %d um, %d us peak, shape %d%%", param1, param2, param3);
+        move_stage_sinusoidal(param1, param2, param3);
+        break;
     case 10:                                     // Set sensor params
         index = get_BCODE_token(index, &param1); // gain
         index = get_BCODE_token(index, &param2); // step
@@ -3348,18 +3286,22 @@ int process_one_BCODE_command(int cmd, int index)
         index = get_BCODE_token(index, &param1); // number of scans (3 readings per scan)
         Log.info("Baseline scans: %d", param1);
         position = stage_position;
+        checkpoint(CP_SPECTRO_READING_START);
         noInterrupts();
         spectrophotometer_reading(true, param1, false);
         interrupts();
+        checkpoint(CP_SPECTRO_READING_COMPLETE);
         move_stage_to_position(position, MOTOR_SLOW_STEP_DELAY);
         break;
     case 14:                                     // Test scans
         index = get_BCODE_token(index, &param1); // number of scans (3 readings per scan)
         Log.info("Test scans: %d", param1);
         position = stage_position;
+        checkpoint(CP_SPECTRO_READING_START);
         noInterrupts();
         spectrophotometer_reading(false, param1, false);
         interrupts();
+        checkpoint(CP_SPECTRO_READING_COMPLETE);
         move_stage_to_position(position, MOTOR_SLOW_STEP_DELAY);
         break;
     case 15:                                     // take sensor readings
@@ -3383,9 +3325,11 @@ int process_one_BCODE_command(int cmd, int index)
         index = get_BCODE_token(index, &param4); // step delay us
         Log.info("Continuous sensor readings: %d %d %d %d", param1, param2, param3, param4);
         position = stage_position;
+        checkpoint(CP_SPECTRO_READING_START);
         noInterrupts();
         spectrophotometer_reading_continuous(param1 == 1, param2, param3, param4, false);
         interrupts();
+        checkpoint(CP_SPECTRO_READING_COMPLETE);
         move_stage_to_position(position, MOTOR_SLOW_STEP_DELAY);
         break;
     case 20: // Repeat begin(number of iterations)
@@ -4001,6 +3945,28 @@ int particle_command(String arg)
         indx = get_next_command_param(arg, indx, &param1, 1);
         result = output_assay_file(param1);
         break;
+    case 410: // dump EEPROM checkpoint buffer
+        dump_checkpoint_buffer_to_serial();
+        result = eeprom.cp_boot_count;
+        break;
+    case 411: // dump flash log file
+        dump_flash_log_to_serial();
+        result = 1;
+        break;
+    case 412: // flush RAM log buffer to file now
+        flush_log_to_file();
+        result = 1;
+        break;
+    case 413: // clear all logs (flash + EEPROM + RAM)
+        clear_all_logs();
+        result = 1;
+        break;
+    case 414: // upload session log to cloud (on-demand)
+        flush_log_to_file();
+        deferred_log_upload = true;
+        Log.info("Session log upload queued");
+        result = 1;
+        break;
     // ===== COMMUNICATION COMMANDS =====
     case 8000:
         displayHelp();
@@ -4083,14 +4049,6 @@ int particle_command(String arg)
 
     case 8503:
         testFCCCompliance();
-        break;
-
-    case 8504:
-        startFCCWorstCase();
-        break;
-
-    case 8505:
-        stopFCCWorstCase();
         break;
 
     // ===== EMISSION CHECK =====
@@ -4203,14 +4161,6 @@ int particle_command(String arg)
         Serial.println("║ ASSAY INFORMATION:                                            ║");
         Serial.printlnf("║   Assay ID:         %-41s ║", assay.id[0] != '\0' ? assay.id : "(none)");
         Serial.printlnf("║   Assay Duration:   %-41d ║", assay.duration);
-        Serial.println("║                                                               ║");
-        Serial.println("║ VALIDATION STATUS:                                            ║");
-        Serial.printlnf("║   Validation Retry Count: %-35d ║", validation_retry_count);
-        Serial.printlnf("║   Validation Request ID:   %-35s ║", validation_request_id.length() > 0 ? validation_request_id.c_str() : "(none)");
-        Serial.printlnf("║   Assay Re-download Pending: %-33s ║", assay_redownload_pending ? "YES" : "NO");
-        if (assay_redownload_pending) {
-            Serial.printlnf("║   Pending Assay ID:       %-35s ║", pending_assay_id[0] != '\0' ? pending_assay_id : "(none)");
-        }
         Serial.println("║                                                               ║");
         Serial.println("║ CLOUD STATUS:                                                 ║");
         Serial.printlnf("║   Cloud Connected:  %-41s ║", Particle.connected() ? "YES" : "NO");
@@ -4347,12 +4297,7 @@ int test_runner(String cartridgeId)
         if (cartridgeId.length() == BARCODE_UUID_LENGTH)
         {
             strcpy(barcode_uuid, cartridgeId.c_str());
-            
-            // Reset retry tracking when starting new validation
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";  // Clear request ID
-            
+
             device_state.transition_to(DeviceMode::VALIDATING_CARTRIDGE);
             return 0;
         }
@@ -4371,11 +4316,18 @@ int test_runner(String cartridgeId)
     }
 }
 
+// Deferred load-assay: cloud function sets the ID, main loop publishes
+String deferred_assay_id = "";
+
 int load_assay(String assayId)
 {
     if (assayId.length() == ASSAY_UUID_LENGTH)
     {
-        publish_load_assay(assayId);
+        // Don't publish from inside the cloud function — Particle may not
+        // deliver the webhook response while a cloud function is executing.
+        // Instead, set a flag and let the main loop handle the publish.
+        deferred_assay_id = assayId;
+        device_log("Load assay requested: %s (deferred to main loop)", assayId.c_str());
         return 0;
     }
     else
@@ -4385,12 +4337,34 @@ int load_assay(String assayId)
     }
 }
 
+int verify_assay(String assayId)
+{
+    struct stat sb;
+    if (assayId.length() != ASSAY_UUID_LENGTH)
+    {
+        Log.error("verify_assay: invalid assay ID length: %d", assayId.length());
+        return -2;
+    }
+    String filename = "/assay/" + assayId;
+    if (stat(filename.c_str(), &sb) == 0)
+    {
+        Log.info("verify_assay: %s exists, size=%ld bytes", assayId.c_str(), sb.st_size);
+        return (int)sb.st_size;
+    }
+    Log.info("verify_assay: %s NOT FOUND", assayId.c_str());
+    return -1;
+}
+
+// Deferred reset-cartridge: cloud function sets the flag, main loop publishes
+bool deferred_reset_cartridge = false;
+
 int reset_cartridge(String cartridgeId)
 {
     if (cartridgeId.length() == BARCODE_UUID_LENGTH)
     {
         memcpy(reset_uuid, cartridgeId.c_str(), BARCODE_UUID_LENGTH + 1);
-        publish_reset_cartridge();
+        deferred_reset_cartridge = true;
+        device_log("Reset cartridge requested: %s (deferred to main loop)", cartridgeId.c_str());
         return 0;
     }
     else
@@ -4748,7 +4722,7 @@ int upload_test_results(String params)
     // Check if Particle is connected
     if (!Particle.connected()) {
         Particle.publish("upload_test_result", "Cannot upload - Particle cloud not connected", PRIVATE);
-        Log.warn("Cannot upload test - Particle cloud not connected");
+        device_log("Cannot upload test - Particle cloud not connected");
         return -2; // Error: not connected
     }
     
@@ -4757,6 +4731,42 @@ int upload_test_results(String params)
     Particle.publish("upload_test_result", "Upload started - transitioning to UPLOADING_RESULTS", PRIVATE);
     Log.info("Upload test results triggered via Particle function");
     return 1; // Success - upload started
+}
+
+/**
+ * @brief Upload session log to cloud (on-demand)
+ *
+ * Particle Cloud function to trigger a one-time upload of the session log.
+ * Replaces the previous automatic periodic upload to conserve data operations.
+ * Also available as serial command 414.
+ *
+ * @param params "?" for help, "" to trigger upload
+ * @return 1 if upload queued, 0 if no log to upload, -1 for help
+ */
+int upload_session_log(String params)
+{
+    if (params == "?" || params == "help" || params == "h") {
+        Particle.publish("upload_log_help",
+            "upload_log: Uploads session log to cloud. "
+            "Flushes RAM buffer to flash, then uploads. "
+            "Also available as serial command 414.",
+            PRIVATE);
+        return -1;
+    }
+
+    flush_log_to_file();
+
+    struct stat st;
+    if (stat("/log/session.txt", &st) != 0 || st.st_size == 0) {
+        Particle.publish("upload_log_result", "No log data to upload", PRIVATE);
+        return 0;
+    }
+
+    deferred_log_upload = true;
+    Particle.publish("upload_log_result",
+                    String::format("Log upload queued (%ld bytes)", st.st_size), PRIVATE);
+    device_log("Session log upload requested via cloud function");
+    return 1;
 }
 
 /////////////////////////////////////////////////////////////
@@ -4779,13 +4789,13 @@ void reset_device_state()
     memset(test.assay_id, 0, ASSAY_UUID_LENGTH + 1);
     memset(assay.id, 0, ASSAY_UUID_LENGTH + 1);
 
-    Log.info("Device state reset to IDLE");
+    device_log("Device state reset to IDLE");
 }
 
 void disconnect_from_cloud()
 {
     int tries = 5;
-    Log.info("Disconnecting from cloud...");
+    device_log("Disconnecting from cloud...");
     Particle.disconnect();
     while (Particle.connected() && tries-- > 0)
     {
@@ -4794,18 +4804,19 @@ void disconnect_from_cloud()
     }
     if (!Particle.connected())
     {
-        Log.info("Disconnected from the cloud");
+        device_log("Disconnected from the cloud");
     }
     else
     {
-        Log.info("Failed to disconnect from the cloud");
+        device_log("Failed to disconnect from the cloud");
     }
+    flush_log_to_file();
 }
 
 void connect_to_cloud()
 {
     int tries = 5;
-    Log.info("Connecting to cloud...");
+    device_log("Connecting to cloud...");
     while (!Particle.connected() && tries-- > 0)
     {
         Particle.connect();
@@ -4813,12 +4824,13 @@ void connect_to_cloud()
     }
     if (Particle.connected())
     {
-        Log.info("Connected to cloud");
+        device_log("Connected to cloud");
     }
     else
     {
-        Log.info("Failed to connect to cloud");
+        device_log("Failed to connect to cloud");
     }
+    flush_log_to_file();
 }
 
 void output_test_readings(BrevitestTestRecord *t)
@@ -4850,22 +4862,26 @@ void output_test_readings(BrevitestTestRecord *t)
  */
 void run_test()
 {
+    checkpoint(CP_TEST_START);
     // === SET TEST STATE ===
     device_state.test_state = TestState::RUNNING;
 
     // === DISCONNECT FROM CLOUD ===
-    // Avoid cloud interference during test execution
+    checkpoint(CP_CLOUD_DISCONNECT);
     disconnect_from_cloud();
+    checkpoint(CP_CLOUD_DISCONNECT_OK);
 
     // === SETUP HARDWARE ===
+    checkpoint(CP_TEST_HARDWARE_SETUP);
     turn_on_dont_touch_LED();
+    checkpoint(CP_STAGE_RESET);
     reset_stage(false);
+    checkpoint(CP_STAGE_RESET_OK);
     move_stage_to_test_start_position();
     turn_on_buzzer_for_duration(1000, 600);
     turn_off_buzzer_timer();
 
     // === STOP TEMPERATURE CONTROL ===
-    // Avoid interference during test execution
     stop_temperature_control();
 
     // === SAVE TEST INFO TO EEPROM ===
@@ -4880,11 +4896,13 @@ void run_test()
     memset(test.reading, 0, sizeof(test.reading));
 
     // === EXECUTE TEST ===
-    Log.info("Running test %s", test.cartridge_id);
+    device_log("Running test %s", test.cartridge_id);
+    checkpoint(CP_BCODE_START);
     test.start_time = millis();
     process_BCODE(0);
     test.duration = (millis() - test.start_time) / 1000;
-    Log.info("Test %s finished, duration: %d sec", test.cartridge_id, test.duration / 1000);
+    checkpoint(CP_BCODE_COMPLETE);
+    device_log("Test %s finished, duration: %d sec", test.cartridge_id, test.duration);
 
     // === RESTART TEMPERATURE CONTROL ===
     start_temperature_control();
@@ -4892,12 +4910,12 @@ void run_test()
     // === CHECK TEST COMPLETION STATUS ===
     if (device_state.test_state == TestState::CANCELLED)
     {
-        Log.info("Test cancelled");
+        device_log("Test cancelled");
         test.number_of_readings = 0;
     }
     else
     {
-        Log.info("Test completed successfully");
+        device_log("Test completed successfully");
         device_state.test_state = TestState::COMPLETED;
     }
 
@@ -4919,8 +4937,11 @@ void run_test()
     reset_stage(true);
     turn_off_buzzer_timer();
 
-    Log.info("Test complete, reconnecting to cloud for upload...");
+    device_log("Test complete, reconnecting to cloud for upload...");
+    checkpoint(CP_CLOUD_CONNECT);
     connect_to_cloud();
+    checkpoint(CP_CLOUD_CONNECT_OK);
+    flush_log_to_file();
 }
 
 /////////////////////////////////////////////////////////////
@@ -5034,17 +5055,28 @@ void setup()
     init_digital_pin(pinMotorStep, OUTPUT, LOW);
     init_digital_pin(pinMotorDir, OUTPUT, LOW);
 
-    // === DEVICE ID AND LOGGING ===
-    device_id = System.deviceID();
-    Log.info("Device ID: %s", device_id.c_str());
-
-    // === PARTICLE CLOUD VARIABLES ===
+    // === PARTICLE CLOUD CONNECTION ===
     waitFor(Particle.connected, 20000);
+
+    // === DEVICE ID ===
+    // Set device_id AFTER cloud connects. On some OTA reboot paths,
+    // System.deviceID() returns empty if called too early.
+    device_id = System.deviceID();
+    if (device_id.length() == 0) {
+        // If still empty, delay briefly and retry — hardware ID should always be available
+        delay(1000);
+        device_id = System.deviceID();
+    }
+    if (device_id.length() == 0) {
+        Log.error("CRITICAL: device_id is empty after retries — webhook responses will not be received");
+    }
+    Log.info("Device ID: %s (length: %d)", device_id.c_str(), device_id.length());
     Particle.variable("temperature", current_temperature);
     Particle.variable("magnet_validation", magnet_validation_data);
 
     // === PARTICLE CLOUD FUNCTIONS ===
     Particle.function("load_assay", load_assay);
+    Particle.function("verify_assay", verify_assay);
     Particle.function("set_wifi_credentials", set_wifi_credentials);
     Particle.function("run_test", test_runner);
     Particle.function("reset_cartridge", reset_cartridge);
@@ -5057,31 +5089,39 @@ void setup()
     Particle.function("force_state", force_state_transition);
     Particle.function("get_barcode_hist", get_barcode_history);
     Particle.function("upload_test", upload_test_results);
+    Particle.function("upload_log", upload_session_log);
 
     // === PARTICLE CLOUD SUBSCRIPTIONS ===
     register_cloud_subscriptions();
 
     // === EEPROM SETUP ===
     setup_eeprom();
-    Log.info("Size of eeprom: %d", sizeof(Particle_EEPROM));
+    device_log("Size of eeprom: %d", sizeof(Particle_EEPROM));
+
+    // === CHECKPOINT TRAIL FROM PREVIOUS SESSION ===
+    dump_checkpoint_trail();
+    write_session_header();
 
     // === DIRECTORY CREATION ===
     create_dir_if_not_exists("/cache");
     create_dir_if_not_exists("/buffer");
     create_dir_if_not_exists("/validation");
     create_dir_if_not_exists("/assay");
+    create_dir_if_not_exists("/log");
 
     // === INTERRUPT SETUP ===
     attachInterrupt(pinCartridgeDetected, detector_changed_interrupt, CHANGE);
 
     // === I2C BUS INITIALIZATION ===
+    checkpoint(CP_I2C_BUS_INIT);
     if (startI2C())
     {
-        Log.info("I2C bus started");
+        checkpoint(CP_I2C_BUS_INIT_OK);
+        device_log("I2C bus started");
     }
     else
     {
-        Log.info("Could not start I2C bus");
+        device_log("Could not start I2C bus");
     }
 
     // === SPECTROPHOTOMETER INITIALIZATION ===
@@ -5117,7 +5157,7 @@ void setup()
     bool test_interrupted = eeprom.running_test_uuid[0] != '\0';
     if (test_interrupted)
     {
-        Log.info("Test interrupted: %s (Assay %s) - saving cancelled test to file", eeprom.running_test_uuid, eeprom.running_assay_id);
+        device_log("Test interrupted: %s (Assay %s) - saving cancelled test to file", eeprom.running_test_uuid, eeprom.running_assay_id);
         memcpy(test.cartridge_id, eeprom.running_test_uuid, BARCODE_UUID_LENGTH + 1);
         memcpy(test.assay_id, eeprom.running_assay_id, ASSAY_UUID_LENGTH + 1);
         write_test_to_file();
@@ -5130,14 +5170,17 @@ void setup()
     reset_device_state();
 
     // === LOGGING ===
-    Log.info("device id: %s", device_id.c_str());
-    Log.info("Firmware version: %d (code: %d)", eeprom.firmware_version, FIRMWARE_VERSION);
-    Log.info("Data format version: %d", eeprom.data_format_version);
-    Log.info("Lifetime stress test cycles: %d", eeprom.lifetime_stress_test_cycles);
-    Log.info("Stress test cycles since reset: %d", eeprom.stress_test_cycles_since_reset);
-    Log.info("Last stress test cycles: %d", eeprom.stress_test_cycles);
-    Log.info("Interrupted test ? %c", test_interrupted ? 'Y' : 'N');
-    Log.info("Cached test ? %c", test_in_cache() ? 'Y' : 'N');
+    device_log("device id: %s", device_id.c_str());
+    device_log("Firmware version: %d (code: %d)", eeprom.firmware_version, FIRMWARE_VERSION);
+    device_log("Data format version: %d", eeprom.data_format_version);
+    device_log("Lifetime stress test cycles: %d", eeprom.lifetime_stress_test_cycles);
+    device_log("Stress test cycles since reset: %d", eeprom.stress_test_cycles_since_reset);
+    device_log("Last stress test cycles: %d", eeprom.stress_test_cycles);
+    device_log("Interrupted test ? %c", test_interrupted ? 'Y' : 'N');
+    device_log("Cached test ? %c", test_in_cache() ? 'Y' : 'N');
+
+    // Flush boot log to file
+    flush_log_to_file();
 
     // === START TEMPERATURE CONTROL ===
     start_temperature_control();
@@ -5153,7 +5196,7 @@ void setup()
     // After crash/reboot, a completed test may be orphaned in cache
     if (test_in_cache())
     {
-        Log.info("Cached test found on boot - transitioning to UPLOADING_RESULTS");
+        device_log("Cached test found on boot - transitioning to UPLOADING_RESULTS");
         device_state.test_state = TestState::UPLOAD_PENDING;
         device_state.transition_to(DeviceMode::UPLOADING_RESULTS);
     }
@@ -5336,19 +5379,21 @@ void barcode_scan_loop()
         // If we're in HEATING mode and already have a pending barcode, don't re-scan
         if (device_state.mode == DeviceMode::HEATING && pending_barcode_available)
         {
-            Log.info("Barcode scan loop: Already have pending barcode, skipping scan (mode: %s)", 
+            device_log("Barcode scan loop: Already have pending barcode, skipping scan (mode: %s)",
                      device_mode_to_string(device_state.mode).c_str());
             return; // Already scanned, waiting for heater to be ready
         }
         
-        Log.info("Barcode scan loop: Starting barcode scan (mode: %s, detector_on: %s)", 
+        device_log("Barcode scan loop: Starting barcode scan (mode: %s, detector_on: %s)",
                  device_mode_to_string(device_state.mode).c_str(),
                  device_state.detector_on ? "YES" : "NO");
-        
+
         // Scan the barcode
+        checkpoint(CP_BARCODE_SCAN);
         int barcode_type = scan_barcode();
-        Log.info("Barcode scan result: %d (mode: %s, barcode: %s)", 
-                 barcode_type, 
+        checkpoint(CP_BARCODE_SCAN_OK);
+        device_log("Barcode scan result: %d (mode: %s, barcode: %s)",
+                 barcode_type,
                  device_mode_to_string(device_state.mode).c_str(),
                  barcode_uuid);
         
@@ -5375,8 +5420,8 @@ void barcode_scan_loop()
                 strcpy(pending_barcode_uuid, barcode_uuid);
                 pending_barcode_available = true;
                 
-                Log.info("Cartridge identified during heating: %s", barcode_uuid);
-                Log.info("Cartridge inserted during heating - please remove cartridge and re-insert when heater is ready");
+                device_log("Cartridge identified during heating: %s", barcode_uuid);
+                device_log("Cartridge inserted during heating - please remove cartridge and re-insert when heater is ready");
                 
                 // Signal user to remove cartridge (LED only, no buzzer)
                 turn_on_remove_cartridge_LED();
@@ -5385,7 +5430,7 @@ void barcode_scan_loop()
                          indicatorRemove.isActive() ? "YES" : "NO");
                 
                 // Transition back to HEATING mode (don't validate or run test)
-                Log.info("Transitioning back to HEATING mode - cartridge rejected, waiting for removal");
+                device_log("Transitioning back to HEATING mode - cartridge rejected, waiting for removal");
                 device_state.transition_to(DeviceMode::HEATING);
                 // Ensure LED stays active after state transition
                 turn_on_remove_cartridge_LED();
@@ -5400,8 +5445,8 @@ void barcode_scan_loop()
                 strcpy(pending_barcode_uuid, barcode_uuid);
                 pending_barcode_available = true;
                 
-                Log.info("Cartridge identified during heating: %s", barcode_uuid);
-                Log.info("Heater not ready - please remove cartridge and re-insert when heater is ready");
+                device_log("Cartridge identified during heating: %s", barcode_uuid);
+                device_log("Heater not ready - please remove cartridge and re-insert when heater is ready");
                 
                 // Signal user to remove cartridge (LED only, no buzzer)
                 turn_on_remove_cartridge_LED();
@@ -5410,7 +5455,7 @@ void barcode_scan_loop()
                          indicatorRemove.isActive() ? "YES" : "NO");
                 
                 // Transition back to HEATING mode (don't validate yet)
-                Log.info("Transitioning back to HEATING mode - barcode stored for later validation");
+                device_log("Transitioning back to HEATING mode - barcode stored for later validation");
                 device_state.transition_to(DeviceMode::HEATING);
                 // Ensure LED stays active after state transition
                 turn_on_remove_cartridge_LED();
@@ -5479,12 +5524,7 @@ void barcode_scan_loop()
             // === DIAGNOSTIC LOGGING FOR VALIDATION ===
             Log.info("Starting cartridge validation for barcode: %s", barcode_uuid);
             Log.info("Cloud connection status: %s", Particle.connected() ? "CONNECTED" : "DISCONNECTED");
-            Log.info("Validation timeout: %lu ms, max retries: %d", (unsigned long)VALIDATION_TIMEOUT_MS, VALIDATION_MAX_RETRIES);
-            
-            // Reset retry tracking when starting new validation
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";  // Clear request ID
+            Log.info("Validation timeout: %lu ms", (unsigned long)VALIDATION_TIMEOUT_MS);
             break;
 
         case BARCODE_TYPE_MAGNETOMETER:
@@ -5531,7 +5571,6 @@ void magnet_validation_loop()
 {
     if (validate_magnets())
     {
-        // Buffer already populated directly during validate_magnets() — no file reload needed
         device_state.transition_to(DeviceMode::IDLE);
     }
 }
@@ -5549,9 +5588,28 @@ void hardware_loop()
     // === HEATER TEMPERATURE MONITORING ===
     previous_heater_ready = heater_ready;
     int temp_delta = heater.target_C_10X - heater.temp_C_10X;
-    // Check that temperature is within range AND positive (temp must be below target)
-    heater_ready = (temp_delta >= 0 && temp_delta < HEATER_READY_TEMP_DELTA);
+    // Check that temperature is within range (allows small overshoot above target)
+    heater_ready = (abs(temp_delta) < HEATER_READY_TEMP_DELTA);
     device_state.heater_ready = heater_ready;
+
+    // Log heater_ready state changes (serial only — flash log captures 0.5°C threshold changes instead)
+    if (heater_ready != previous_heater_ready)
+    {
+        Log.info("Heater ready: %s (temp: %d.%d C, target: %d.%d C)",
+                 heater_ready ? "YES" : "NO",
+                 heater.temp_C_10X / 10, heater.temp_C_10X % 10,
+                 heater.target_C_10X / 10, heater.target_C_10X % 10);
+    }
+
+    // Log temperature changes > 0.5°C (5 units in 10X representation)
+    if (abs(heater.temp_C_10X - last_logged_temp) >= 5)
+    {
+        device_log("Heater temp: %d.%d C (target: %d.%d C, pwr: %d, err: %d, int: %d)",
+                 heater.temp_C_10X / 10, heater.temp_C_10X % 10,
+                 heater.target_C_10X / 10, heater.target_C_10X % 10,
+                 heater.power, temp_delta, heater.integral);
+        last_logged_temp = heater.temp_C_10X;
+    }
 
     // === CARTRIDGE DETECTION DEBOUNCING ===
     if (detector_debouncing)
@@ -5565,7 +5623,7 @@ void hardware_loop()
             bool new_detector_state = digitalRead(pinCartridgeDetected) == LOW;
             device_state.detector_on = new_detector_state;
 
-            Log.info("%s detected", new_detector_state ? "Insertion" : "Removal");
+            device_log("%s detected", new_detector_state ? "Insertion" : "Removal");
 
             if (new_detector_state)
             {
@@ -5616,7 +5674,7 @@ void hardware_loop()
                         // === EARLY DETECTION: Cartridge inserted during heating ===
                         // Always scan barcode when inserted during heating, regardless of heater state
                         device_state.cartridge_state = CartridgeState::DETECTED;
-                        Log.info("Cartridge detected during heating - transitioning to BARCODE_SCANNING for early detection");
+                        device_log("Cartridge detected during heating - transitioning to BARCODE_SCANNING for early detection");
                         device_state.transition_to(DeviceMode::BARCODE_SCANNING);
                         Log.info("Will scan barcode but not validate until heater ready");
                     }
@@ -5647,22 +5705,12 @@ void hardware_loop()
                 reset_stage(true);
                 turn_off_buzzer_timer();
                 device_state.clear_current_barcode();  // Clear barcode tracking
-                
-                // === CLEANUP VALIDATION RETRY TRACKING ===
-                validation_retry_count = 0;
-                validation_retry_delay_until = 0;
-                validation_request_id = "";  // Clear request ID
+
                 if (device_state.cloud_operation_pending)
                 {
                     device_state.end_cloud_operation();
                 }
-                
-                // === CLEANUP ASSAY RE-DOWNLOAD TRACKING ===
-                assay_redownload_pending = false;
-                pending_assay_id[0] = '\0';
-                pending_checksum = 0;
-                pending_cartridge_id[0] = '\0';
-                
+
                 // === CLEANUP PENDING BARCODE (keep it for reuse if re-inserted) ===
                 // Note: We keep pending_barcode_available = true so if user re-inserts
                 // the same cartridge after heater is ready, we can reuse it
@@ -5743,14 +5791,13 @@ void loop()
     // Detect when connection is restored (subscriptions persist in RAM, no re-registration needed)
     if (current_cloud_connected && !last_cloud_connected)
     {
-        Log.info("Cloud connection restored");
+        device_log("Cloud connection restored");
     }
     last_cloud_connected = current_cloud_connected;
     
     // === ALWAYS RUN THESE ===
     process_serial_port(); // Handle serial commands
     hardware_loop();       // Handle hardware state changes
-    updateFCCWorstCase();  // FCC emission test motor/buzzer updates (no-op when inactive)
 
     // === STATE-DRIVEN OPERATION ===
     // Each device mode has specific actions that are appropriate for that state
@@ -5771,7 +5818,8 @@ void loop()
         // Check for timeout if we're waiting for a response
         else if (device_state.cloud_operation_pending && device_state.is_cloud_operation_timeout(30000))
         {
-            Log.error("Cartridge reset timeout - no response from cloud");
+            device_log("Cartridge reset timeout - no response from cloud");
+            checkpoint(CP_WEBHOOK_TIMEOUT);
             device_state.set_error("Cartridge reset timeout");
         }
         break;
@@ -5784,13 +5832,13 @@ void loop()
             // === HANDLE DISCONNECTION DURING UPLOAD ===
             if (device_state.cloud_operation_pending)
             {
-                Log.error("Cloud disconnected during upload - clearing pending operation");
+                device_log("Cloud disconnected during upload - clearing pending operation");
                 device_state.end_cloud_operation();
             }
             // Attempt to reconnect if not already waiting for response
             if (!device_state.cloud_operation_pending)
             {
-                Log.info("Not connected to Particle cloud - attempting to reconnect");
+                device_log("Not connected to Particle cloud - attempting to reconnect");
                 connect_to_cloud();
             }
             break;
@@ -5804,7 +5852,8 @@ void loop()
         // Check for timeout if we're waiting for a response
         else if (device_state.cloud_operation_pending && device_state.is_cloud_operation_timeout(30000))
         {
-            Log.error("Test upload timeout - no response from cloud");
+            device_log("Test upload timeout - no response from cloud");
+            checkpoint(CP_WEBHOOK_TIMEOUT);
             device_state.set_error("Test upload timeout");
         }
         break;
@@ -5823,259 +5872,78 @@ void loop()
         // Early exit if device transitioned to error state
         if (device_state.is_error())
         {
-            break;  // Error state handled elsewhere
+            break;
         }
-        
+
         // Check if cartridge was removed during validation
         if (!device_state.detector_on || !device_state.has_cartridge())
         {
-            Log.warn("Cartridge removed during validation");
+            device_log("Cartridge removed during validation");
             if (device_state.cloud_operation_pending)
             {
                 device_state.end_cloud_operation();
             }
-            validation_retry_count = 0;
-            validation_retry_delay_until = 0;
-            validation_request_id = "";
             device_state.reset_to_idle();
             break;
         }
-        
-        // Check cloud connection first
+
+        // Cloud disconnected during validation — fail immediately
         if (!Particle.connected())
         {
-            // === HANDLE DISCONNECTION DURING VALIDATION ===
             if (device_state.cloud_operation_pending)
             {
-                Log.error("Cloud disconnected during validation - clearing pending operation");
+                device_log("Cloud disconnected during validation");
                 device_state.end_cloud_operation();
-                
-                // Check if we can retry when connection is restored
-                if (validation_retry_count < VALIDATION_MAX_RETRIES)
-                {
-                    validation_retry_count++;
-                    unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
-                    validation_retry_delay_until = millis() + backoff_delay;
-                    validation_request_id = "";  // Clear request ID for retry
-                    
-                    Log.info("Cloud disconnected, will retry when connection restored in %lu ms (attempt %d/%d)", 
-                             backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-                }
-                else
-                {
-                    // Max retries exceeded - set error
-                    device_state.cartridge_state = CartridgeState::INVALID;
-                    device_state.set_error("No cloud connection - max retries exceeded");
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";
-                }
             }
-            else
-            {
-                // Not waiting for response, but not connected - check if we should retry
-                if (validation_retry_count < VALIDATION_MAX_RETRIES && 
-                    (validation_retry_delay_until == 0 || millis() >= validation_retry_delay_until))
-                {
-                    // Will retry when publish_validate_cartridge is called
-                    Log.warn("Not connected to Particle cloud - will retry when connection restored");
-                }
-                else if (validation_retry_count >= VALIDATION_MAX_RETRIES)
-                {
-                    // Max retries exceeded
-                    device_state.cartridge_state = CartridgeState::INVALID;
-                    device_state.set_error("No cloud connection - max retries exceeded");
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";
-                }
-            }
+            device_state.cartridge_state = CartridgeState::INVALID;
+            device_state.set_error("No cloud connection for validation");
             break;
         }
-        
-        // === DIAGNOSTIC: LOG STATUS ON FIRST ENTRY ===
-        static unsigned long last_validation_status_log = 0;
-        if (last_validation_status_log == 0 || (millis() - last_validation_status_log) > 30000)
+
+        // === PERIODIC STATUS LOG ===
         {
-            Log.info("Validation status - Barcode: %s, Cloud pending: %s, Retry count: %d", 
-                     barcode_uuid, 
-                     device_state.cloud_operation_pending ? "YES" : "NO",
-                     validation_retry_count);
-            last_validation_status_log = millis();
+            static unsigned long last_validation_status_log = 0;
+            if (last_validation_status_log == 0 || (millis() - last_validation_status_log) > 30000)
+            {
+                Log.info("Validation status - Barcode: %s, Cloud pending: %s",
+                         barcode_uuid,
+                         device_state.cloud_operation_pending ? "YES" : "NO");
+                last_validation_status_log = millis();
+            }
         }
-        
+
         // === CHECK FOR TIMEOUT IF WAITING FOR RESPONSE ===
         if (device_state.cloud_operation_pending)
         {
-            // Use configurable timeout (can be increased for slow networks)
-            unsigned long timeout_ms = VALIDATION_TIMEOUT_MS;
-            
-            // Check if timeout has occurred
-            if (device_state.is_cloud_operation_timeout(timeout_ms))
+            if (device_state.is_cloud_operation_timeout(VALIDATION_TIMEOUT_MS))
             {
-                Log.warn("Cartridge validation timeout - no response from cloud after %lu ms", timeout_ms);
-                
-                // Check if we can retry
-                // CRITICAL: Check retry count BEFORE incrementing to ensure we don't exceed max retries
-                // The retry count represents attempts already made, so we check if we can make one more
-                if (validation_retry_count < VALIDATION_MAX_RETRIES)
-                {
-                    // Increment retry count BEFORE scheduling retry
-                    validation_retry_count++;
-                    
-                    // Calculate exponential backoff delay
-                    unsigned long backoff_delay = VALIDATION_RETRY_BACKOFF_BASE * validation_retry_count;
-                    validation_retry_delay_until = millis() + backoff_delay;
-                    
-                    // Clear cloud operation to allow retry
-                    device_state.end_cloud_operation();
-                    
-                    // Clear old request ID - new one will be generated on retry
-                    validation_request_id = "";
-                    
-                    Log.info("Validation timeout, will retry in %lu ms (attempt %d/%d)", 
-                             backoff_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-                    Log.info("Retry scheduled - delay until: %lu ms (current: %lu ms)", 
-                             validation_retry_delay_until, millis());
-                }
-                else
-                {
-                    // Max retries exceeded - clear cloud operation and set error
-                    Log.error("Cartridge validation timeout after %d attempts - giving up", 
-                              validation_retry_count + 1);
-                    
-                    // Ensure cloud operation is cleared before setting error
-                    device_state.end_cloud_operation();
-                    
-                    // Set error state (this will transition to ERROR_STATE)
-                    device_state.cartridge_state = CartridgeState::INVALID;
-                    device_state.set_error("Cartridge validation timeout");
-                    
-                    // Clear retry tracking
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";  // Clear request ID on final timeout
-                    
-                    // CRITICAL: Break out of VALIDATING_CARTRIDGE loop after setting error
-                    // The mode has changed to ERROR_STATE, so we should exit this case
-                    break;  // Exit validation loop - device is now in ERROR_STATE
-                }
+                device_log("Cartridge validation timeout - no response after %lu ms", (unsigned long)VALIDATION_TIMEOUT_MS);
+                checkpoint(CP_WEBHOOK_TIMEOUT);
+                device_state.end_cloud_operation();
+                device_state.cartridge_state = CartridgeState::INVALID;
+                device_state.set_error("Cartridge validation timeout");
+                break;
             }
             else
             {
-                // Still waiting for response - log periodic status
+                // Still waiting — log periodic status
                 static unsigned long last_wait_log = 0;
                 unsigned long elapsed = millis() - device_state.cloud_operation_start_time;
-                if (last_wait_log == 0 || (millis() - last_wait_log) >= 10000) // Log every 10 seconds
+                if (last_wait_log == 0 || (millis() - last_wait_log) >= 10000)
                 {
-                    Log.info("Waiting for validation response... (%lu ms elapsed, timeout: %lu ms)", 
-                             elapsed, timeout_ms);
+                    Log.info("Waiting for validation response... (%lu ms elapsed, timeout: %lu ms)",
+                             elapsed, (unsigned long)VALIDATION_TIMEOUT_MS);
                     last_wait_log = millis();
                 }
             }
         }
-        
+
         // === PUBLISH VALIDATION REQUEST ===
-        // Only validate if heater ready and not already waiting for response
-        // Also check if we're waiting for retry delay before attempting to publish
         if (heater_debounced() && !device_state.cloud_operation_pending)
         {
-            // === CHECK IF WAITING FOR RETRY DELAY ===
-            // Use safe comparison that handles millis() overflow
-            bool waiting_for_retry = false;
-            if (validation_retry_delay_until > 0)
-            {
-                // === CHECK IF CARTRIDGE STILL PRESENT DURING RETRY DELAY ===
-                // If cartridge was removed, cancel the retry
-                if (!device_state.detector_on || !device_state.has_cartridge())
-                {
-                    Log.warn("Cartridge removed during validation retry delay - cancelling retry");
-                    // Clear retry tracking since cartridge is gone
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";
-                    if (device_state.cloud_operation_pending)
-                    {
-                        device_state.end_cloud_operation();
-                    }
-                    // State will be reset by hardware_loop() - don't transition here
-                    break;  // Exit validation loop
-                }
-                
-                unsigned long current_time = millis();
-                // Handle millis() overflow: if delay time is in the past (wrapped around),
-                // consider the delay as elapsed
-                if (validation_retry_delay_until > current_time)
-                {
-                    // Normal case: delay time is in the future
-                    unsigned long remaining_delay = validation_retry_delay_until - current_time;
-                    static unsigned long last_retry_wait_log = 0;
-                    if (last_retry_wait_log == 0 || (current_time - last_retry_wait_log) >= 5000) // Log every 5 seconds
-                    {
-                        Log.info("Waiting for retry delay before republishing - %lu ms remaining (attempt %d/%d)", 
-                                 remaining_delay, validation_retry_count, VALIDATION_MAX_RETRIES);
-                        last_retry_wait_log = current_time;
-                    }
-                    waiting_for_retry = true;
-                }
-                // If delay time <= current_time, delay has elapsed or overflowed - proceed
-            }
-            
-            if (!waiting_for_retry)
-            {
-                // === VERIFY CARTRIDGE STILL PRESENT BEFORE RETRY ===
-                // Check if cartridge was removed during retry delay
-                if (!device_state.detector_on || !device_state.has_cartridge())
-                {
-                    Log.warn("Cartridge removed during validation retry delay - cancelling retry");
-                    // Clear retry tracking since cartridge is gone
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";
-                    if (device_state.cloud_operation_pending)
-                    {
-                        device_state.end_cloud_operation();
-                    }
-                    // State will be reset by hardware_loop() - don't transition here
-                    break;  // Exit validation loop
-                }
-                
-                // === VERIFY STILL IN VALIDATING_CARTRIDGE MODE ===
-                // Ensure we're still in the correct mode (shouldn't happen, but safety check)
-                if (device_state.mode != DeviceMode::VALIDATING_CARTRIDGE)
-                {
-                    Log.warn("Device mode changed during validation retry delay - cancelling retry (current mode: %s)",
-                             device_mode_to_string(device_state.mode).c_str());
-                    // Clear retry tracking
-                    validation_retry_count = 0;
-                    validation_retry_delay_until = 0;
-                    validation_request_id = "";
-                    break;  // Exit validation loop
-                }
-                
-                // Retry delay has elapsed or no retry delay set - proceed with publish
-                if (validation_retry_delay_until > 0)
-                {
-                    // Retry delay just elapsed - clear it and log
-                    Log.info("Retry delay elapsed - proceeding with retry attempt %d/%d", 
-                             validation_retry_count, VALIDATION_MAX_RETRIES);
-                    validation_retry_delay_until = 0;
-                }
-                
-                // === DIAGNOSTIC: LOG BEFORE PUBLISHING ===
-                if (validation_retry_count > 0)
-                {
-                    Log.info("Preparing to publish validation retry - Barcode: %s, Attempt: %d/%d, Cloud connected: %s", 
-                             barcode_uuid, validation_retry_count, VALIDATION_MAX_RETRIES, 
-                             Particle.connected() ? "YES" : "NO");
-                }
-                else
-                {
-                    Log.info("Preparing to publish validation - Barcode: %s, Cloud connected: %s", 
-                             barcode_uuid, Particle.connected() ? "YES" : "NO");
-                }
-                publish_validate_cartridge();
-            }
+            Log.info("Publishing validation - Barcode: %s, Cloud connected: %s",
+                     barcode_uuid, Particle.connected() ? "YES" : "NO");
+            publish_validate_cartridge();
         }
         break;
 
@@ -6091,9 +5959,35 @@ void loop()
     case DeviceMode::IDLE:
         // === IDLE MODE ===
         // Wait for state changes from hardware_loop
-        // No specific actions needed - hardware_loop handles transitions
+        // Periodically flush log buffer to file and attempt log upload
+        {
+            // Handle deferred publishes from cloud functions
+            // Publishing inside a cloud function context prevents Particle
+            // from delivering the webhook response back to the device.
+            if (deferred_assay_id.length() > 0) {
+                publish_load_assay(deferred_assay_id);
+                deferred_assay_id = "";
+            }
+            if (deferred_reset_cartridge) {
+                deferred_reset_cartridge = false;
+                publish_reset_cartridge();
+            }
+
+            static unsigned long last_idle_flush = 0;
+            if (last_idle_flush == 0 || (millis() - last_idle_flush) >= LOG_FLUSH_IDLE_INTERVAL_MS)
+            {
+                flush_log_to_file();
+                last_idle_flush = millis();
+            }
+            // Handle deferred log upload (triggered via cloud function or serial command)
+            if (deferred_log_upload)
+            {
+                deferred_log_upload = false;
+                try_upload_session_log();
+            }
+        }
         break;
-        
+
     case DeviceMode::HEATING:
         // === HEATING MODE ===
         // Check if heater became ready while cartridge with pending barcode is still inserted
@@ -6103,7 +5997,7 @@ void loop()
             // Transition to barcode scanning to re-scan and validate
             if (device_state.can_transition_to(DeviceMode::BARCODE_SCANNING))
             {
-                Log.info("Heater ready - re-scanning cartridge with pending barcode: %s", pending_barcode_uuid);
+                device_log("Heater ready - re-scanning cartridge with pending barcode: %s", pending_barcode_uuid);
                 device_state.transition_to(DeviceMode::BARCODE_SCANNING);
             }
         }
