@@ -5549,8 +5549,14 @@ void hardware_loop()
     // === HEATER TEMPERATURE MONITORING ===
     previous_heater_ready = heater_ready;
     int temp_delta = heater.target_C_10X - heater.temp_C_10X;
-    // Check that temperature is within range AND positive (temp must be below target)
-    heater_ready = (temp_delta >= 0 && temp_delta < HEATER_READY_TEMP_DELTA);
+    // Hysteresis: once ready, stay ready until the temperature drifts beyond
+    // the wider EXIT band. Symmetric (abs) so a small overshoot above target
+    // does not drop readiness — the previous `temp_delta >= 0` check made the
+    // flag flap every time the PID crossed the target.
+    if (heater_ready)
+        heater_ready = (abs(temp_delta) < HEATER_READY_EXIT_DELTA);
+    else
+        heater_ready = (abs(temp_delta) < HEATER_READY_ENTER_DELTA);
     device_state.heater_ready = heater_ready;
 
     // === CARTRIDGE DETECTION DEBOUNCING ===

@@ -131,7 +131,12 @@
 #define HEATER_CONTROL_INTERVAL 1000
 #define HEATER_PULSE_DURATION 800
 #define HEATER_DEFAULT_TEMP_TARGET 450
-#define HEATER_READY_TEMP_DELTA 10
+// Heater readiness hysteresis: ready latches on inside ENTER delta of the
+// target and only drops out beyond EXIT delta. A single threshold flaps with
+// PID ripple at the band edge (indicator LED toggles red/green and cartridges
+// get spuriously rejected).
+#define HEATER_READY_ENTER_DELTA 7
+#define HEATER_READY_EXIT_DELTA 13
 #define HEATER_READY_DEBOUNCE_DELAY 5000
 #define HEATER_MAX_RAW_READING 890
 #define HEATER_MIN_RAW_READING 550
