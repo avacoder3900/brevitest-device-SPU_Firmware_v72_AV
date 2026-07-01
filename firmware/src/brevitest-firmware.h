@@ -7,7 +7,7 @@
 // GLOBAL VARIABLES AND DEFINES
 
 // general constants
-#define FIRMWARE_VERSION 79
+#define FIRMWARE_VERSION 81
 #define DATA_FORMAT_VERSION 40
 
 #define TEST_DATA_FORMAT_CODE 'J'
@@ -134,10 +134,11 @@
 #define HEATER_MAX_POWER 255
 #define HEATER_DEFAULT_POWER 64
 #define HEATER_PWM_FREQUENCY 150
-#define HEATER_MAX_TEMPERATURE 600
+#define HEATER_MAX_TEMPERATURE 1250 // [115C-TEST] was 600 (60.0C). Bounded cutoff at 125.0C — kept ON, not removed.
+#define HEATER_MAX_RAW_CEILING 2585 // [115C-TEST] table-INDEPENDENT hard cutoff on raw ADC (~150C real, est). Trips regardless of table accuracy — the real safety net while calibrating.
 #define HEATER_CONTROL_INTERVAL 1000
 #define HEATER_PULSE_DURATION 800
-#define HEATER_DEFAULT_TEMP_TARGET 450
+#define HEATER_DEFAULT_TEMP_TARGET 450 // [115C-TEST] restored safe 45.0C boot default; raise remotely via set_temp (up to 1250)
 #define HEATER_READY_TEMP_DELTA 10
 #define HEATER_READY_DEBOUNCE_DELAY 5000
 #define HEATER_MAX_RAW_READING 890
@@ -154,7 +155,7 @@
 
 // thermistors
 #define THERMISTOR_SCALE 10000
-#define TERMISTOR_TABLE_LENGTH 21
+#define TERMISTOR_TABLE_LENGTH 33 // [115C-TEST] CALIBRATED table, 0..160C in 5C steps
 
 // pubsub
 #define PUBSUB_EVENT_MAX_LENGTH 32
@@ -168,6 +169,15 @@
 #define MAGNETOMETER_CONNECT_DELAY 3000
 #define MAGNETOMETER_MAX_FILES 50
 #define MAGNETOMETER_BUFFER_SIZE 1024
+// Wait one full peripheral read cycle (5 wells x 3 chips) before sampling BLE characteristic after stage move
+#define MAGNETOMETER_READ_SETTLE_MS 250
+#define MAGNETOMETER_READ_RETRIES 4
+#define MAGNETOMETER_RETRY_DELAY_MS 150
+#define MAGNETOMETER_FIELDS_EXPECTED 12
+
+// upload retry
+#define UPLOAD_MAX_RETRIES 3
+#define UPLOAD_TIMEOUT_MS 30000
 
 // assay cache
 #define ASSAY_MAX_FILES 50

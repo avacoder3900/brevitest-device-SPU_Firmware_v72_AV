@@ -19,8 +19,12 @@ SYSTEM_THREAD(ENABLED);
 /////////////////////////////////////////////////////////////
 
 //  temperature is 10x to get one decimal place of accuracy
-static int table_temperature[] = {1000, 950, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50, 0};
-static int table_raw[] = {2438, 2290, 2136, 1977, 1814, 1651, 1488, 1329, 1174, 1028, 890, 763, 647, 544, 452, 372, 304, 245, 196, 155, 122};
+// [115C-TEST] CALIBRATED table (2026-07-01) from co-located thermocouple on the
+// heating element. NTC quadratic fit (ln(x)=a+b/T+c/T^2) to 4 real pairs:
+// raw763=54C, raw1155=78C, raw1825=110C, raw2443=150C. Fit residual +/-2-3C.
+// Replaces the original table which read ~50C LOW at 100C. Table spans 0..160C.
+static int table_temperature[] = {1600, 1550, 1500, 1450, 1400, 1350, 1300, 1250, 1200, 1150, 1100, 1050, 1000, 950, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50, 0};
+static int table_raw[] = {2590, 2523, 2453, 2380, 2304, 2226, 2144, 2060, 1973, 1884, 1793, 1700, 1605, 1510, 1414, 1318, 1222, 1128, 1035, 944, 856, 771, 691, 614, 542, 475, 413, 356, 305, 258, 217, 181, 149};
 
 int raw_table_lookup(int raw)
 {
@@ -28,7 +32,7 @@ int raw_table_lookup(int raw)
 
     if (raw > table_raw[0])
     {
-        return table_raw[0];
+        return table_temperature[0]; // [115C-TEST] was table_raw[0] (bug: returned raw as temp). Now clamps to top table temp so the over-temp cutoff still trips above the table.
     }
 
     for (indx1 = 0, indx2 = 1; indx1 < (TERMISTOR_TABLE_LENGTH - 1); indx1++, indx2++)
@@ -1819,19 +1823,58 @@ void close_magnet_validation_file(int fd)
     device_log("write_magnet_validation_to_file, test size: %d, event data size: %d, file size: %ld", sizeof test, event.data().size(), statbuf.st_size);
 }
 
+// Count tab-separated fields in a magnetometer reading string.
+// Magnetometer publishes 12 floats (T,X,Y,Z for sample/ctrlLow/ctrlHigh) joined by '\t'.
+static int count_tab_fields(const String &s)
+{
+    if (s.length() == 0) return 0;
+    int n = 1;
+    for (unsigned int i = 0; i < s.length(); i++)
+    {
+        if (s.charAt(i) == '\t') n++;
+    }
+    return n;
+}
+
 void check_magnets_in_one_well(int well, int fd)
 {
     BleCharacteristic characteristic;
-    String result, out_str;
+    String result, prev_result, out_str;
+    bool got_data = false;
 
     move_stage(well_move[well], MOTOR_SLOW_STEP_DELAY);
+
+    // Settle: wait long enough for the BLE peripheral to complete at least one
+    // full read cycle of all 5 wells x 3 chips so the cached characteristic
+    // reflects the new stage position rather than the previous well.
+    delay(MAGNETOMETER_READ_SETTLE_MS);
+
     if (magnetometer.getCharacteristicByUUID(characteristic, bleCharUuid[well]))
     {
-        characteristic.getValue(result);
+        // Retry until we get a full 12-field reading. Empty/short reads happen
+        // when we race the peripheral mid-update; another cycle fixes it.
+        for (int attempt = 0; attempt < MAGNETOMETER_READ_RETRIES; attempt++)
+        {
+            characteristic.getValue(result);
+            if (count_tab_fields(result) >= MAGNETOMETER_FIELDS_EXPECTED)
+            {
+                got_data = true;
+                break;
+            }
+            prev_result = result;
+            delay(MAGNETOMETER_RETRY_DELAY_MS);
+        }
+        if (!got_data)
+        {
+            device_log("Well %d: incomplete BLE read after %d attempts (last len=%d, fields=%d)",
+                       well + 1, MAGNETOMETER_READ_RETRIES, result.length(), count_tab_fields(result));
+            result = "INVALID";
+        }
     }
     else
     {
-        result = "Could not find magnetometer data";
+        device_log("Well %d: BLE characteristic not found", well + 1);
+        result = "INVALID";
     }
     out_str = String::format("%d\t%s\r\n", (well + 1), result.c_str());
     Serial.print(out_str.c_str());
@@ -1871,6 +1914,33 @@ int validate_magnets()
                 close_magnet_validation_file(fd);
                 magnetometer.disconnect();
                 reset_stage(true);
+
+                // Load just-written file into magnet_validation_data and publish
+                // as "magnet-validation" so BIMS sees the readings via the
+                // existing /api/particle/webhook endpoint (eventType passes
+                // through as "magnet-validation", body lands as raw text).
+                int bytes_loaded = load_latest_magnet_validation(false);
+                if (bytes_loaded > 0 && Particle.connected())
+                {
+                    if (lastPublish == 0 || (millis() - lastPublish) >= publishPeriod.count())
+                    {
+                        lastPublish = millis();
+                        bool pub_ok = Particle.publish("magnet-validation",
+                                                       magnet_validation_data,
+                                                       PRIVATE);
+                        device_log("magnet-validation publish %s (%d bytes, barcode %s)",
+                                   pub_ok ? "OK" : "FAILED", bytes_loaded, barcode_uuid);
+                    }
+                    else
+                    {
+                        device_log("magnet-validation publish skipped: rate-limited");
+                    }
+                }
+                else
+                {
+                    device_log("magnet-validation publish skipped: bytes=%d, connected=%s",
+                               bytes_loaded, Particle.connected() ? "YES" : "NO");
+                }
                 return 1;
             }
             else
@@ -2361,6 +2431,7 @@ void stress_test_read_spectrophotometer()
 #define HEATER_READINGS 20
 #define HEATER_BAND_PASS_TAIL 4
 int heater_reads[HEATER_READINGS];
+int cal_raw_val = 0; // [115C-TEST] live averaged raw ADC, exposed as cloud var "cal_raw"
 int get_heater_temperature()
 {
     int raw = 0;
@@ -2391,6 +2462,15 @@ int get_heater_temperature()
     }
 
     raw /= HEATER_READINGS - 2 * HEATER_BAND_PASS_TAIL;
+    cal_raw_val = raw; // [115C-TEST] expose live averaged raw ADC for calibration
+    if (raw > HEATER_MAX_RAW_CEILING) // [115C-TEST] table-INDEPENDENT hard safety cutoff
+    {
+        device_log("Heater RAW ceiling: raw=%d > %d - cutting heater", raw, HEATER_MAX_RAW_CEILING);
+        checkpoint(CP_HEATER_OVERHEAT);
+        stop_temperature_control();
+        set_heater_power(0);
+        return 0;
+    }
     heater.temp_C_10X = raw_table_lookup(raw);
     current_temperature = heater.temp_C_10X;
     heater.temp_F_10X = ((heater.temp_C_10X * 9) / 5) + 320;
@@ -2481,6 +2561,30 @@ void stop_temperature_control()
     temperature_control_on = false;
     set_heater_power(0);
     device_log("Temperature control system stopped");
+}
+
+// [115C-TEST] Remote heater setpoint — change the target WITHOUT reflashing.
+// Param = target in tenths of a degree C (e.g. "1150" = 115.0C).
+// Clamped to HEATER_MAX_TEMPERATURE (the 125.0C cutoff). "0" or less = heater OFF.
+// Returns the applied target in tenths C, or 0 if the heater was turned off.
+int set_temp(String params)
+{
+    int t = params.toInt();
+    if (t <= 0)
+    {
+        stop_temperature_control();
+        device_log("set_temp: heater OFF (remote)");
+        return 0;
+    }
+    if (t > HEATER_MAX_TEMPERATURE)
+    {
+        t = HEATER_MAX_TEMPERATURE;
+    }
+    heater.target_C_10X = t;
+    heater.read_time = 0;
+    start_temperature_control();
+    device_log("set_temp: target set to %d.%d C (remote)", t / 10, t % 10);
+    return t;
 }
 
 /////////////////////////////////////////////////////////////
@@ -2693,6 +2797,11 @@ void publish_validate_cartridge()
 {
     particle::Variant data;
 
+    // Clear stale state from any prior publish (e.g. upload-test binary content)
+    // BEFORE checking isSending(), otherwise a stuck flag from a previous reuse
+    // of the global `event` object can permanently block this publish path.
+    event.clear();
+
     // === CHECK IF WE CAN PUBLISH ===
     if (!event.isSending() && ((lastPublish == 0) || (millis() - lastPublish >= publishPeriod.count())))
     {
@@ -2713,7 +2822,6 @@ void publish_validate_cartridge()
         // === PREPARE CLOUD EVENT ===
         lastPublish = millis();
         clear_payload_buffer();
-        event.clear();
         event.name("validate-cartridge");
         event.contentType(ContentType::STRUCTURED);
         data.set("uuid", barcode_uuid);
@@ -2884,6 +2992,10 @@ void publish_reset_cartridge()
 {
     particle::Variant data;
 
+    // Clear stale state from any prior publish before checking isSending();
+    // see publish_validate_cartridge() for rationale.
+    event.clear();
+
     // === CHECK IF WE CAN PUBLISH ===
     if (!event.isSending() && ((lastPublish == 0) || (millis() - lastPublish >= publishPeriod.count())))
     {
@@ -2891,7 +3003,6 @@ void publish_reset_cartridge()
         device_state.start_cloud_operation();
 
         // === PREPARE CLOUD EVENT ===
-        event.clear();
         event.name("reset-cartridge");
         event.contentType(ContentType::STRUCTURED);
         data.set("uuid", reset_uuid);
@@ -2966,6 +3077,10 @@ void publish_load_assay(String assay_to_load)
 {
     particle::Variant data;
 
+    // Clear stale state from any prior publish before checking isSending();
+    // see publish_validate_cartridge() for rationale.
+    event.clear();
+
     if (!event.isSending() && ((lastPublish == 0) || (millis() - lastPublish >= publishPeriod.count())))
     {
         Variant data;
@@ -2973,7 +3088,6 @@ void publish_load_assay(String assay_to_load)
         lastPublish = millis();
 
         clear_payload_buffer();
-        event.clear();
         event.name("load-assay");
         event.contentType(ContentType::STRUCTURED);
         data.set("assay_id", assay_to_load);
@@ -3128,6 +3242,12 @@ void response_load_assay(const char *event_name, const char *data)
  */
 void publish_upload_test()
 {
+    // Clear stale state from previous publishes (e.g. validate-cartridge)
+    // BEFORE the isSending() guard. The shared global `event` object can carry
+    // an isSending=true flag from a prior publish that never properly settled,
+    // which would permanently block uploads until reboot.
+    event.clear();
+
     // === CHECK IF WE CAN PUBLISH ===
     if (!event.isSending() && ((lastPublish == 0) || (millis() - lastPublish >= publishPeriod.count())))
     {
@@ -3161,10 +3281,6 @@ void publish_upload_test()
         // === PREPARE CLOUD EVENT ===
         lastPublish = millis();
         device_state.start_cloud_operation();
-
-        // Clear stale state from previous publishes (e.g. validate-cartridge)
-        // before reusing the global event object with a different content type
-        event.clear();
 
         event.name("upload-test");
         event.contentType(ContentType::BINARY);
@@ -5131,12 +5247,10 @@ void run_test()
     memset(eeprom.running_assay_id, 0, ASSAY_UUID_LENGTH + 1);
     EEPROM.put(0, eeprom);
 
-    // === TRANSITION TO UPLOAD MODE ===
-    device_state.cartridge_state = CartridgeState::TEST_COMPLETE;
-    device_state.test_state = TestState::UPLOAD_PENDING;
-    device_state.transition_to(DeviceMode::UPLOADING_RESULTS);
-
     // === CLEANUP AND RECONNECT FOR UPLOAD ===
+    // Reconnect BEFORE transitioning to UPLOADING_RESULTS. If we transition first,
+    // the main loop sees !Particle.connected() and triggers a re-entrant
+    // connect_to_cloud() while this one is still running (5 tries x 5s blocking).
     reset_stage(true);
     turn_off_buzzer_timer();
 
@@ -5144,6 +5258,12 @@ void run_test()
     checkpoint(CP_CLOUD_CONNECT);
     connect_to_cloud();
     checkpoint(CP_CLOUD_CONNECT_OK);
+
+    // === TRANSITION TO UPLOAD MODE ===
+    device_state.cartridge_state = CartridgeState::TEST_COMPLETE;
+    device_state.test_state = TestState::UPLOAD_PENDING;
+    device_state.transition_to(DeviceMode::UPLOADING_RESULTS);
+
     flush_log_to_file();
 }
 
@@ -5275,6 +5395,7 @@ void setup()
     }
     Log.info("Device ID: %s (length: %d)", device_id.c_str(), device_id.length());
     Particle.variable("temperature", current_temperature);
+    Particle.variable("cal_raw", cal_raw_val); // [115C-TEST] live raw ADC for calibration
     Particle.variable("magnet_validation", magnet_validation_data);
 
     // === PARTICLE CLOUD FUNCTIONS ===
@@ -5283,6 +5404,7 @@ void setup()
     Particle.function("set_wifi_credentials", set_wifi_credentials);
     Particle.function("run_test", test_runner);
     Particle.function("reset_cartridge", reset_cartridge);
+    Particle.function("set_temp", set_temp); // [115C-TEST] remote heater setpoint (tenths C; 0 = off)
     
     // State management functions
     Particle.function("get_state", get_device_state);
@@ -6030,35 +6152,62 @@ void loop()
 
     case DeviceMode::UPLOADING_RESULTS:
         // === TEST UPLOAD MODE ===
-        // Check cloud connection first
-        if (!Particle.connected())
         {
-            // === HANDLE DISCONNECTION DURING UPLOAD ===
-            if (device_state.cloud_operation_pending)
+            // Per-entry retry counter, reset whenever we leave UPLOADING_RESULTS.
+            // Cached test file is on flash, so retrying is safe and avoids
+            // stranding the result in ERROR_STATE on a transient cloud blip.
+            static int upload_retry_count = 0;
+            static DeviceMode last_upload_mode = DeviceMode::IDLE;
+            if (last_upload_mode != DeviceMode::UPLOADING_RESULTS)
             {
-                device_log("Cloud disconnected during upload - clearing pending operation");
-                device_state.end_cloud_operation();
+                upload_retry_count = 0;
             }
-            // Attempt to reconnect if not already waiting for response
+            last_upload_mode = DeviceMode::UPLOADING_RESULTS;
+
+            // Check cloud connection first
+            if (!Particle.connected())
+            {
+                // === HANDLE DISCONNECTION DURING UPLOAD ===
+                if (device_state.cloud_operation_pending)
+                {
+                    device_log("Cloud disconnected during upload - clearing pending operation");
+                    device_state.end_cloud_operation();
+                }
+                // Attempt to reconnect if not already waiting for response
+                if (!device_state.cloud_operation_pending)
+                {
+                    device_log("Not connected to Particle cloud - attempting to reconnect");
+                    connect_to_cloud();
+                }
+                break;
+            }
+
+            // Only publish if not already waiting for response
             if (!device_state.cloud_operation_pending)
             {
-                device_log("Not connected to Particle cloud - attempting to reconnect");
-                connect_to_cloud();
+                publish_upload_test();
             }
-            break;
-        }
-        
-        // Only publish if not already waiting for response
-        if (!device_state.cloud_operation_pending)
-        {
-            publish_upload_test();
-        }
-        // Check for timeout if we're waiting for a response
-        else if (device_state.cloud_operation_pending && device_state.is_cloud_operation_timeout(30000))
-        {
-            device_log("Test upload timeout - no response from cloud");
-            checkpoint(CP_WEBHOOK_TIMEOUT);
-            device_state.set_error("Test upload timeout");
+            // Check for timeout if we're waiting for a response
+            else if (device_state.is_cloud_operation_timeout(UPLOAD_TIMEOUT_MS))
+            {
+                checkpoint(CP_WEBHOOK_TIMEOUT);
+                device_state.end_cloud_operation();
+                upload_retry_count++;
+                if (upload_retry_count < UPLOAD_MAX_RETRIES)
+                {
+                    device_log("Test upload timeout - retry %d/%d (cached file preserved)",
+                               upload_retry_count, UPLOAD_MAX_RETRIES);
+                    // Stay in UPLOADING_RESULTS; next loop iteration calls publish_upload_test()
+                    // again because cloud_operation_pending is now false.
+                }
+                else
+                {
+                    device_log("Test upload timeout after %d retries - cached file preserved for next boot",
+                               UPLOAD_MAX_RETRIES);
+                    upload_retry_count = 0;
+                    device_state.set_error("Test upload timeout");
+                }
+            }
         }
         break;
 
