@@ -8,7 +8,7 @@
 #include "brevitest-firmware.h"
 #include "DFRobot_AS7341.h"
 
-PRODUCT_VERSION(79);
+PRODUCT_VERSION(85);
 SYSTEM_MODE(AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
 
@@ -1805,6 +1805,77 @@ int clear_validation_files()
     return count;
 }
 
+// Prune the validation directory when it exceeds MAGNETOMETER_MAX_FILES.
+// load_latest_magnet_validation() and list_validation_files() stop scanning
+// after MAGNETOMETER_MAX_FILES entries, so files past that point are invisible
+// and the device re-serves stale data forever (SPU 203 froze this way at file
+// #51). Deleting all but the newest file keeps the directory under the cap.
+int prune_validation_files()
+{
+    DIR *validation = opendir("/validation");
+    int count = 0;
+    int latest = 0;
+
+    do
+    {
+        validation_entry = readdir(validation);
+        if (validation_entry == NULL)
+        {
+            break;
+        }
+        if (validation_entry->d_type != DT_REG)
+        {
+            continue;
+        }
+        count++;
+        String filename = String(validation_entry->d_name);
+        int timestamp = filename.substring(7, filename.length() - 4).toInt();
+        if (timestamp > latest)
+        {
+            latest = timestamp;
+        }
+    } while (validation_entry != NULL);
+    closedir(validation);
+
+    if (count <= MAGNETOMETER_MAX_FILES)
+    {
+        return 0;
+    }
+
+    device_log("Pruning validation files: %d found, keeping newest (magnet-%d.txt)", count, latest);
+    String keep = "magnet-" + String(latest) + ".txt";
+    int deleted = 0;
+    validation = opendir("/validation");
+    do
+    {
+        validation_entry = readdir(validation);
+        if (validation_entry == NULL)
+        {
+            break;
+        }
+        if (validation_entry->d_type != DT_REG)
+        {
+            continue;
+        }
+        if (keep == validation_entry->d_name)
+        {
+            continue;
+        }
+        String filename = "/validation/" + String(validation_entry->d_name);
+        if (unlink(filename) == 0)
+        {
+            deleted++;
+        }
+        else
+        {
+            Log.error("Failed to delete %s", validation_entry->d_name);
+        }
+    } while (validation_entry != NULL);
+    closedir(validation);
+    device_log("Pruned %d validation files", deleted);
+    return deleted;
+}
+
 int create_magnet_validation_file()
 {
     magnet_validation_filename = magnet_file_path + String(Time.now()) + ".txt";
@@ -1914,6 +1985,10 @@ int validate_magnets()
                 close_magnet_validation_file(fd);
                 magnetometer.disconnect();
                 reset_stage(true);
+
+                // Keep the directory under the scan cap so the file just
+                // written (the newest) is always visible to load_latest.
+                prune_validation_files();
 
                 // Load just-written file into magnet_validation_data and publish
                 // as "magnet-validation" so BIMS sees the readings via the
